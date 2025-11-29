@@ -39,3 +39,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Cursor IDE
+.cursor/
+
+# Secrets/Keys
+*-storage-key.json
+*.key.json
