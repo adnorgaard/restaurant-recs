@@ -39,9 +39,15 @@ pip install -r requirements.txt
    - Note the connection string (e.g., `postgresql://user:password@localhost:5432/restaurant_recs`)
 
 4. Set up Google Cloud Storage:
-   - Create a GCS bucket for storing images
-   - Create a service account with Storage Admin permissions
-   - Download the service account JSON key file
+   - **See `GCS_SETUP.md` for detailed step-by-step instructions**
+   - Quick summary:
+     - Create a GCS bucket in Google Cloud Console
+     - Create a service account with Storage Admin permissions
+     - Download the service account JSON key file
+   - After setup, validate your configuration:
+     ```bash
+     python scripts/validate_gcs_setup.py
+     ```
 
 5. Create a `.env` file in the root directory:
 ```bash
