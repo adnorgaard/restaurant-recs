@@ -10,6 +10,7 @@ class Restaurant(Base):
     id = Column(Integer, primary_key=True, index=True)
     place_id = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=False)
+    description = Column(String, nullable=True)  # AI-generated description of the restaurant
     embedding = Column(JSON, nullable=True)  # Vector embedding for semantic search (stored as JSON array)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

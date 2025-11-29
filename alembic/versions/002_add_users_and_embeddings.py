@@ -54,13 +54,13 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_user_restaurant_interactions_id'), 'user_restaurant_interactions', ['id'], unique=False)
     op.create_index('idx_user_id', 'user_restaurant_interactions', ['user_id'], unique=False)
-    op.create_index('idx_restaurant_id', 'user_restaurant_interactions', ['restaurant_id'], unique=False)
+    op.create_index('idx_interactions_restaurant_id', 'user_restaurant_interactions', ['restaurant_id'], unique=False)
     op.create_index('idx_interaction_type', 'user_restaurant_interactions', ['interaction_type'], unique=False)
 
 
 def downgrade() -> None:
     op.drop_index('idx_interaction_type', table_name='user_restaurant_interactions')
-    op.drop_index('idx_restaurant_id', table_name='user_restaurant_interactions')
+    op.drop_index('idx_interactions_restaurant_id', table_name='user_restaurant_interactions')
     op.drop_index('idx_user_id', table_name='user_restaurant_interactions')
     op.drop_index(op.f('ix_user_restaurant_interactions_id'), table_name='user_restaurant_interactions')
     op.drop_table('user_restaurant_interactions')
