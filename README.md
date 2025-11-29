@@ -1,188 +1,195 @@
-# Restaurant Image Classifier Bot
+# 🍽️ Restaurant Recommendation Engine
 
-A Python REST API that classifies and describes restaurants by analyzing images from Google Places API using OpenAI GPT-4 Vision.
+An AI-powered restaurant discovery platform that analyzes restaurant photos to understand vibes, aesthetics, and cuisine—then uses that understanding to power smart recommendations and semantic search.
+
+## What It Does
+
+1. **Sees** — Fetches restaurant photos from Google Places API
+2. **Understands** — GPT-4 Vision analyzes images to extract tags (vibe, cuisine, atmosphere, price tier)
+3. **Remembers** — Caches everything (images in GCS, analysis in PostgreSQL) for instant repeat queries
+4. **Recommends** — Finds similar restaurants using AI-generated tags and vector embeddings
+5. **Searches** — Natural language queries like "romantic Italian spot with outdoor seating"
 
 ## Features
 
-- Fetches restaurant images from Google Places API
-- **Caches images in Google Cloud Storage and PostgreSQL** to save API credits
-- Analyzes images using OpenAI GPT-4 Vision
-- Returns structured tags and natural language descriptions
-- Supports both place_id and name-based restaurant lookup
-- Web interface for easy testing with URL input
-- Displays fetched images alongside classification results
-- **Update image tags** (category and AI-generated tags) via API
+### 🔍 Image Analysis
+- Automatic image categorization (interior, exterior, food, drink, bar, menu)
+- AI-generated descriptive tags for each restaurant
+- Natural language descriptions of restaurant vibes
+
+### ⚡ Smart Caching
+- Images cached in Google Cloud Storage
+- Analysis results cached in PostgreSQL
+- First request builds cache, subsequent requests are instant
+
+### 🎯 Recommendations
+- **Tag-based**: Jaccard similarity on AI-generated tags
+- **Embedding-based**: Cosine similarity on vector embeddings
+- **Hybrid**: Weighted combination of both approaches
+
+### 🔎 Semantic Search
+- Natural language queries powered by OpenAI embeddings
+- "Find me a cozy coffee shop with good pastries"
+- "Upscale steakhouse with a bar scene"
+
+### 👤 User System
+- JWT-based authentication
+- Like/dislike/rate restaurants
+- Personalized interaction history
+
+## Tech Stack
+
+- **API**: FastAPI (Python 3.8+)
+- **Database**: PostgreSQL + Alembic migrations
+- **AI**: OpenAI GPT-4 Vision + text-embedding-3-small
+- **Storage**: Google Cloud Storage
+- **External APIs**: Google Places API (New)
 
 ## Prerequisites
 
 - Python 3.8+
+- PostgreSQL database
+- Google Cloud Storage bucket + service account
 - Google Places API key
 - OpenAI API key
-- PostgreSQL database
-- Google Cloud Storage bucket
-- Google Cloud service account credentials (for GCS access)
 
-## Setup
+## Quick Start
 
-1. Clone the repository and navigate to the project directory:
+### 1. Clone and Install
+
 ```bash
+git clone <repo-url>
 cd restaurant-recs
-```
-
-2. Install dependencies:
-```bash
 pip install -r requirements.txt
 ```
 
-3. Set up PostgreSQL database:
-   - Create a PostgreSQL database for the application
-   - Note the connection string (e.g., `postgresql://user:password@localhost:5432/restaurant_recs`)
+### 2. Set Up Environment
 
-4. Set up Google Cloud Storage:
-   - **See `GCS_SETUP.md` for detailed step-by-step instructions**
-   - Quick summary:
-     - Create a GCS bucket in Google Cloud Console
-     - Create a service account with Storage Admin permissions
-     - Download the service account JSON key file
-   - After setup, validate your configuration:
-     ```bash
-     python scripts/validate_gcs_setup.py
-     ```
+Create a `.env` file:
 
-5. Create a `.env` file in the root directory:
 ```bash
-GOOGLE_PLACES_API_KEY=your_google_places_api_key_here
-OPENAI_API_KEY=your_openai_api_key_here
+# Required
+GOOGLE_PLACES_API_KEY=your_google_places_api_key
+OPENAI_API_KEY=your_openai_api_key
 DATABASE_URL=postgresql://user:password@localhost:5432/restaurant_recs
-GCS_BUCKET_NAME=your-gcs-bucket-name
+
+# Google Cloud Storage
+GCS_BUCKET_NAME=your-bucket-name
 GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+
+# Optional (for auth)
+JWT_SECRET_KEY=your-secret-key
 ```
 
-6. Run database migrations:
+### 3. Set Up Database
+
 ```bash
 alembic upgrade head
 ```
 
-## Running the API
+### 4. Set Up GCS
 
-Start the FastAPI server:
+See `GCS_SETUP.md` for detailed instructions, or run:
+
+```bash
+python scripts/validate_gcs_setup.py
+```
+
+### 5. Run
+
 ```bash
 uvicorn app.main:app --reload
 ```
 
-The API will be available at `http://localhost:8000`
+Open `http://localhost:8000` for the web interface.
 
-## Testing Interface
+## API Overview
 
-A simple web interface is available for testing at `http://localhost:8000`
+### Core Endpoints
 
-Simply:
-1. Open `http://localhost:8000` in your browser
-2. Paste a Google Maps restaurant URL
-3. Click "Classify Restaurant"
-4. View the fetched images and AI-generated tags/description
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/classify` | POST | Analyze a restaurant from place_id or name |
+| `/test` | POST | Analyze from Google Maps URL (web interface) |
+| `/api/search` | POST | Semantic search with natural language |
+| `/api/restaurants/{id}/similar` | GET | Get similar restaurants |
 
-The interface displays:
-- All images fetched from Google Places
-- AI-generated tags (e.g., "cozy", "upscale", "italian")
-- Natural language description of the restaurant
+### Authentication
 
-## API Documentation
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/register` | POST | Create new user |
+| `/token` | POST | Login, get JWT |
+| `/me` | GET | Get current user (requires auth) |
 
-Once the server is running, you can access:
-- Interactive API docs: `http://localhost:8000/docs`
-- Alternative docs: `http://localhost:8000/redoc`
-- Test interface: `http://localhost:8000`
+### User Interactions
 
-## API Endpoints
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/interactions` | POST | Like/dislike/rate a restaurant (requires auth) |
 
-### POST /classify
+### Utilities
 
-Classify a restaurant based on images from Google Places API.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/find-place-id` | POST | Get place_id from restaurant name or URL |
+| `/health` | GET | Health check with database status |
+| `/api/restaurants/{id}/generate-embedding` | POST | Generate embedding for a restaurant |
 
-**Request Body:**
-```json
-{
-  "place_id": "ChIJN1t_tDeuEmsRUsoyG83frY4"
-}
+## Usage Examples
+
+### Classify a Restaurant
+
+```bash
+# By place_id
+curl -X POST "http://localhost:8000/classify" \
+  -H "Content-Type: application/json" \
+  -d '{"place_id": "ChIJN1t_tDeuEmsRUsoyG83frY4"}'
+
+# By name + location
+curl -X POST "http://localhost:8000/classify" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "The French Laundry", "location": "Yountville, CA"}'
 ```
 
-Or using name and location:
-```json
-{
-  "name": "The French Laundry",
-  "location": "Yountville, CA"
-}
+### Semantic Search
+
+```bash
+curl -X POST "http://localhost:8000/api/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "romantic Italian restaurant with candles", "limit": 5}'
 ```
 
-**Response:**
-```json
-{
-  "restaurant_name": "The French Laundry",
-  "tags": ["upscale", "fine-dining", "french", "romantic", "award-winning"],
-  "description": "An elegant fine-dining restaurant with a sophisticated atmosphere, known for its exceptional French cuisine and impeccable service."
-}
+### Get Similar Restaurants
+
+```bash
+# Hybrid (default) - combines tags and embeddings
+curl "http://localhost:8000/api/restaurants/1/similar?method=hybrid&limit=10"
+
+# Tags only
+curl "http://localhost:8000/api/restaurants/1/similar?method=tags"
+
+# Embeddings only
+curl "http://localhost:8000/api/restaurants/1/similar?method=embedding"
 ```
 
-### POST /test
+### User Registration and Interaction
 
-Test endpoint that accepts a restaurant URL and returns images and classification.
+```bash
+# Register
+curl -X POST "http://localhost:8000/register" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "password123"}'
 
-**Request Body:**
-```json
-{
-  "url": "https://www.google.com/maps/place/Restaurant+Name"
-}
-```
+# Login
+curl -X POST "http://localhost:8000/token" \
+  -d "username=user@example.com&password=password123"
 
-**Response:**
-```json
-{
-  "restaurant_name": "Restaurant Name",
-  "image_urls": ["https://maps.googleapis.com/...", ...],
-  "tags": ["cozy", "upscale", "italian"],
-  "description": "A detailed description..."
-}
-```
-
-### GET /health
-
-Health check endpoint.
-
-**Response:**
-```json
-{
-  "status": "healthy"
-}
-```
-
-### PUT /api/images/{image_id}/tags
-
-Update tags for a specific cached image.
-
-**Request Body:**
-```json
-{
-  "category": "interior",
-  "ai_tags": ["cozy", "romantic", "upscale"]
-}
-```
-
-Both `category` and `ai_tags` are optional - only provided fields will be updated.
-
-**Valid categories:** `interior`, `exterior`, `food`, `menu`, `bar`, `other`
-
-**Response:**
-```json
-{
-  "id": 1,
-  "restaurant_id": 1,
-  "photo_name": "places/ChIJ.../photos/Aap_uEA...",
-  "gcs_url": "https://storage.googleapis.com/...",
-  "category": "interior",
-  "ai_tags": ["cozy", "romantic", "upscale"],
-  "message": "Image tags updated successfully"
-}
+# Like a restaurant (with token)
+curl -X POST "http://localhost:8000/api/interactions" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"restaurant_id": 1, "interaction_type": "like"}'
 ```
 
 ## Project Structure
@@ -190,74 +197,71 @@ Both `category` and `ai_tags` are optional - only provided fields will be update
 ```
 restaurant-recs/
 ├── app/
-│   ├── __init__.py
-│   ├── main.py              # FastAPI application
-│   ├── database.py          # Database connection and session management
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── places_service.py    # Google Places API integration
-│   │   ├── vision_service.py    # OpenAI Vision API integration
-│   │   ├── storage_service.py   # Google Cloud Storage integration
-│   │   └── database_service.py  # Database operations
-│   └── models/
-│       ├── __init__.py
-│       ├── schemas.py           # Pydantic models for request/response
-│       └── database.py          # SQLAlchemy database models
-├── alembic/                   # Database migrations
-│   ├── versions/
-│   └── env.py
-├── alembic.ini                # Alembic configuration
+│   ├── main.py                    # FastAPI app, all endpoints
+│   ├── database.py                # Database connection
+│   ├── models/
+│   │   ├── database.py            # SQLAlchemy models
+│   │   └── schemas.py             # Pydantic request/response schemas
+│   └── services/
+│       ├── places_service.py      # Google Places API integration
+│       ├── vision_service.py      # GPT-4 Vision analysis
+│       ├── storage_service.py     # Google Cloud Storage
+│       ├── database_service.py    # Database operations + caching
+│       ├── embedding_service.py   # Vector embeddings
+│       ├── recommendation_service.py  # Similarity algorithms
+│       ├── auth_service.py        # JWT authentication
+│       └── debug_service.py       # Cache inspection tools
+├── alembic/                       # Database migrations
+├── scripts/                       # Setup and utility scripts
 ├── requirements.txt
-├── .env                        # Your environment variables (not in git)
-└── README.md
+└── .env                           # Your environment variables
 ```
-
-## Error Handling
-
-The API handles various error scenarios:
-- Missing or invalid place_id
-- Restaurant not found
-- No images available
-- API rate limits
-- Invalid API keys
-
-All errors return appropriate HTTP status codes with descriptive error messages.
-
-## Example Usage
-
-Using curl:
-```bash
-curl -X POST "http://localhost:8000/classify" \
-  -H "Content-Type: application/json" \
-  -d '{"place_id": "ChIJN1t_tDeuEmsRUsoyG83frY4"}'
-```
-
-Using Python:
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/classify",
-    json={"place_id": "ChIJN1t_tDeuEmsRUsoyG83frY4"}
-)
-print(response.json())
-```
-
-## Notes
-
-- The API fetches up to 5 images per restaurant by default
-- Images are analyzed together to provide comprehensive classification
-- Tags and descriptions are generated based on ambiance, cuisine type, price level, and other characteristics
-- **Images are cached after first fetch** - subsequent requests for the same restaurant will use cached images from Google Cloud Storage, saving Google Places API credits
-- Categories and AI tags are automatically stored in the database after analysis
-- You can manually update tags using the `/api/images/{image_id}/tags` endpoint
 
 ## Database Schema
 
-The application uses two main tables:
+### restaurants
+- `id`, `place_id`, `name`, `description`, `embedding`, `created_at`, `updated_at`
 
-- **restaurants**: Stores restaurant information (place_id, name)
-- **restaurant_images**: Stores image metadata (GCS URL, category, AI tags) linked to restaurants
+### restaurant_images  
+- `id`, `restaurant_id`, `photo_name`, `gcs_url`, `gcs_bucket_path`, `category`, `ai_tags`, `created_at`, `updated_at`
 
-Run `alembic upgrade head` to create the database schema.
+### users
+- `id`, `email`, `hashed_password`, `is_active`, `is_superuser`, `created_at`, `updated_at`
 
+### user_restaurant_interactions
+- `id`, `user_id`, `restaurant_id`, `interaction_type`, `rating`, `created_at`, `updated_at`
+
+## Caching Architecture
+
+The system uses a multi-tier caching strategy:
+
+1. **Images**: Stored in GCS after first fetch (never re-downloaded from Google Places)
+2. **Categories**: Stored per-image in PostgreSQL (AI categorization runs once)
+3. **Tags & Description**: Stored per-restaurant (AI analysis runs once)
+4. **Embeddings**: Stored per-restaurant (generated once from tags)
+
+Result: First request may take 5-10s, subsequent requests < 100ms.
+
+See `CACHING_ARCHITECTURE.md` for detailed documentation.
+
+## Debug Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/debug/cache/{place_id}` | Inspect cache status for a restaurant |
+| `/debug/trace` | Trace request flow and identify bottlenecks |
+| `/debug/reset-cache/{place_id}` | Clear cache for re-analysis |
+| `/debug/force-recategorize/{place_id}` | Re-run AI categorization |
+| `/debug/backfill-images/{place_id}` | Create DB records for GCS images |
+
+## Documentation
+
+- **API Docs**: `http://localhost:8000/docs` (Swagger UI)
+- **Alternative**: `http://localhost:8000/redoc` (ReDoc)
+- **GCS Setup**: `GCS_SETUP.md`
+- **Caching Details**: `CACHING_ARCHITECTURE.md`
+- **Debug Guide**: `DEBUG_GUIDE.md`
+
+## License
+
+MIT
