@@ -1,4 +1,6 @@
 import os
+import hashlib
+import base64
 from typing import Optional, Tuple
 from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError
@@ -40,6 +42,47 @@ def get_storage_client() -> storage.Client:
         raise StorageServiceError(f"Failed to create GCS client: {str(e)}")
 
 
+def compute_content_hash(image_bytes: bytes) -> str:
+    """
+    Compute MD5 hash of image content for duplicate detection.
+    Returns base64-encoded hash (same format as GCS md5Hash).
+    """
+    md5 = hashlib.md5(image_bytes)
+    return base64.b64encode(md5.digest()).decode('utf-8')
+
+
+def find_existing_image_by_content(
+    bucket: storage.Bucket,
+    place_id: str,
+    content_hash: str,
+    content_size: int
+) -> Optional[str]:
+    """
+    Check if an image with the same content already exists in GCS.
+    
+    Args:
+        bucket: GCS bucket object
+        place_id: Google Places place_id to search within
+        content_hash: Base64-encoded MD5 hash of the image content
+        content_size: Size of the image in bytes
+        
+    Returns:
+        bucket_path of existing image if found, None otherwise
+    """
+    prefix = f"images/{place_id}/"
+    
+    try:
+        for blob in bucket.list_blobs(prefix=prefix):
+            # Compare both hash and size for accurate matching
+            if blob.md5_hash == content_hash and blob.size == content_size:
+                return blob.name
+    except Exception:
+        # If listing fails, proceed with upload
+        pass
+    
+    return None
+
+
 def upload_image_to_gcs(
     image_bytes: bytes,
     place_id: str,
@@ -47,7 +90,10 @@ def upload_image_to_gcs(
     content_type: str = "image/jpeg"
 ) -> Tuple[str, str]:
     """
-    Upload image to Google Cloud Storage.
+    Upload image to Google Cloud Storage with content-hash duplicate prevention.
+    
+    If an image with identical content already exists for this place_id,
+    returns the existing image's URL instead of uploading a duplicate.
     
     Args:
         image_bytes: Image data as bytes
@@ -68,6 +114,22 @@ def upload_image_to_gcs(
         client = get_storage_client()
         bucket = client.bucket(GCS_BUCKET_NAME)
         
+        # Compute content hash for duplicate detection
+        content_hash = compute_content_hash(image_bytes)
+        content_size = len(image_bytes)
+        
+        # Check if identical image already exists
+        existing_path = find_existing_image_by_content(
+            bucket, place_id, content_hash, content_size
+        )
+        
+        if existing_path:
+            # Duplicate found - return existing image's URL
+            public_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{existing_path}"
+            print(f"[GCS] ♻️  Duplicate detected, reusing existing: {existing_path[-40:]}...")
+            return public_url, existing_path
+        
+        # No duplicate - proceed with upload
         # Create a safe filename from photo_name
         # photo_name is like "places/ChIJ.../photos/Aap_uEA..."
         # Extract just the photo ID part for the filename
@@ -89,6 +151,7 @@ def upload_image_to_gcs(
             # Bucket has uniform access - construct URL directly
             public_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{bucket_path}"
         
+        print(f"[GCS] ✅ Uploaded new image: {bucket_path[-40:]}...")
         return public_url, bucket_path
         
     except GoogleCloudError as e:

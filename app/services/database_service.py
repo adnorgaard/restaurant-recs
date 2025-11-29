@@ -106,6 +106,10 @@ def cache_images(
     """
     Store images and metadata in database and upload to GCS.
     
+    Uses content-hash duplicate prevention:
+    - GCS layer: If identical image content exists, reuses existing file
+    - DB layer: If GCS path already has a record, reuses existing record
+    
     Args:
         db: Database session
         place_id: Google Places place_id
@@ -125,7 +129,7 @@ def cache_images(
         cached_images = []
         
         for image_bytes, photo_name, category in images_with_metadata:
-            # Check if image already exists
+            # Check if image already exists by photo_name
             existing_image = db.query(RestaurantImage).filter(
                 RestaurantImage.restaurant_id == restaurant.id,
                 RestaurantImage.photo_name == photo_name
@@ -133,21 +137,20 @@ def cache_images(
             
             if existing_image:
                 # Update category if it's different
-                if existing_image.category != category:
+                if existing_image.category != category and category is not None:
                     existing_image.category = category
                     db.commit()
                     db.refresh(existing_image)
                 cached_images.append(existing_image)
                 continue
             
-            # Upload to GCS
+            # Upload to GCS (with content-hash duplicate detection)
             try:
                 public_url, bucket_path = upload_image_to_gcs(
                     image_bytes,
                     place_id,
                     photo_name
                 )
-                print(f"[DEBUG] Successfully uploaded {photo_name} to GCS: {public_url[:50]}...")
             except StorageServiceError as e:
                 # Log error but continue with other images
                 import traceback
@@ -160,7 +163,25 @@ def cache_images(
                 print(f"[ERROR] Traceback: {traceback.format_exc()}")
                 continue
             
-            # Create database record
+            # Check if a DB record already exists for this GCS path
+            # (This happens when GCS detected a content duplicate)
+            existing_by_path = db.query(RestaurantImage).filter(
+                RestaurantImage.restaurant_id == restaurant.id,
+                RestaurantImage.gcs_bucket_path == bucket_path
+            ).first()
+            
+            if existing_by_path:
+                # GCS path already has a record - this is a content duplicate
+                # Update category if needed and return existing record
+                if existing_by_path.category != category and category is not None:
+                    existing_by_path.category = category
+                    db.commit()
+                    db.refresh(existing_by_path)
+                print(f"[DB] ♻️  Reusing existing DB record for duplicate content")
+                cached_images.append(existing_by_path)
+                continue
+            
+            # Create new database record
             new_image = RestaurantImage(
                 restaurant_id=restaurant.id,
                 photo_name=photo_name,
