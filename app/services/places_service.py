@@ -303,9 +303,11 @@ def get_restaurant_name(place_id: str) -> str:
     return str(display_name) if display_name else "Unknown Restaurant"
 
 
-def extract_place_id_from_url(url: str) -> str:
+def extract_place_id_from_url(url: str, db: Optional[Session] = None) -> str:
     """
     Extract place_id from Google Maps or Google Places URL, or search by restaurant name.
+    
+    First checks the database using semantic search to avoid unnecessary API calls.
     
     Supports:
     - Restaurant names: "Joe's Pizza, New York" or just "Joe's Pizza"
@@ -315,6 +317,7 @@ def extract_place_id_from_url(url: str) -> str:
     
     Args:
         url: Google Maps URL, share link, or restaurant name/address
+        db: Optional database session to check for cached restaurants first
         
     Returns:
         place_id string
@@ -326,6 +329,30 @@ def extract_place_id_from_url(url: str) -> str:
     
     original_input = url.strip()
     url = original_input
+    
+    # Step 0.5: Check database first if it looks like a text query (not a URL)
+    # This avoids API calls for restaurants we've already seen
+    url_patterns = [
+        r'^https?://',  # Standard http/https
+        r'^maps://',    # Maps protocol
+        r'^goo\.gl/',   # Short URL without protocol
+        r'^maps\.app\.goo\.gl/',  # Maps app short URL
+    ]
+    
+    is_url = any(re.match(pattern, url, re.IGNORECASE) for pattern in url_patterns)
+    
+    if not is_url and db:
+        # This looks like a restaurant name/address, not a URL
+        # Check database first using semantic search
+        try:
+            from app.services.database_service import find_restaurant_by_text
+            cached_place_id = find_restaurant_by_text(db, url, min_similarity=0.75)
+            if cached_place_id:
+                print(f"[DEBUG] Found restaurant in database: {url} -> {cached_place_id}")
+                return cached_place_id
+        except Exception as e:
+            # Log but continue to API search
+            print(f"[WARNING] Database search failed, falling back to API: {str(e)}")
     
     # Step 0: Check if input is just a restaurant name (not a URL)
     # If it doesn't look like a URL, treat it as a restaurant name/address
@@ -780,26 +807,19 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
             cached_images = get_cached_images(db, place_id, max_images)
             
             if cached_images:
-                # Download images from GCS URLs and return GCS URLs
-                images = []
-                image_urls = []
-                photo_names = []
-                for cached_image in cached_images:
-                    try:
-                        response = requests.get(cached_image.gcs_url, timeout=10)
-                        response.raise_for_status()
-                        images.append(response.content)
-                        image_urls.append(cached_image.gcs_url)
-                        photo_names.append(cached_image.photo_name)
-                    except requests.RequestException:
-                        # If GCS URL fails, continue to next image
-                        continue
-                
-                if images:
-                    return images, image_urls, photo_names
+                print(f"[DEBUG] Found {len(cached_images)} cached images in database")
+                # Return cached URLs and photo_names directly - NO GCS downloads, NO API calls
+                # The caller should check if they need image bytes (for categorization/AI)
+                # If categories and AI tags are already cached, no bytes needed!
+                image_urls = [img.gcs_url for img in cached_images]
+                photo_names = [img.photo_name for img in cached_images]
+                # Return empty bytes - caller will only download if needed for processing
+                return [], image_urls, photo_names
         except Exception as e:
             # If cache check fails, fall through to API fetch
-            print(f"Warning: Cache check failed: {str(e)}")
+            import traceback
+            print(f"[ERROR] Cache check failed: {str(e)}")
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
     
     # No cache or cache miss - fetch from Google API
     if not GOOGLE_PLACES_API_KEY:
@@ -822,10 +842,7 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
         if not photo_name:
             continue
         
-        # Build the image URL using our proxy endpoint
-        image_url = f"/api/places/photo/{photo_name}?maxWidthPx=800"
-        
-        # Fetch the actual image
+        # Fetch the actual image from Google Places API
         try:
             headers = {
                 "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY
@@ -837,32 +854,66 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
             response.raise_for_status()
             image_bytes = response.content
             images.append(image_bytes)
-            image_urls.append(image_url)
+            # Use placeholder URL for now - will be updated after GCS upload
+            image_urls.append(None)
             photo_names.append(photo_name)
             photo_metadata.append((image_bytes, photo_name))
         except requests.RequestException as e:
             # Continue with other images if one fails
+            print(f"[WARNING] Failed to fetch image from Places API: {str(e)}")
             continue
     
     if not images:
         raise PlacesServiceError("Failed to download any images")
     
-    # Cache the images if db session is provided
+    # Cache the images to GCS if db session is provided
+    # This is REQUIRED for the URLs to work - we need GCS URLs, not proxy URLs
     if db and photo_metadata:
         try:
-            from app.services.database_service import cache_images, get_cached_images
+            from app.services.database_service import cache_images
             restaurant_name = get_restaurant_name(place_id)
+            print(f"[DEBUG] Caching {len(photo_metadata)} images to GCS for {place_id}")
             # Note: category will be set later by vision_service
-            cache_images(db, place_id, restaurant_name, [
+            cached_result = cache_images(db, place_id, restaurant_name, [
                 (img_bytes, photo_name, None) for img_bytes, photo_name in photo_metadata
             ])
-            # Update URLs to use GCS URLs from cache
-            cached_images = get_cached_images(db, place_id, max_images)
-            if cached_images:
-                image_urls = [img.gcs_url for img in cached_images[:len(images)]]
+            print(f"[DEBUG] Successfully cached {len(cached_result)} images to GCS")
+            
+            # Get GCS URLs directly from the cached_result (RestaurantImage objects)
+            # Build a mapping from photo_name to GCS URL
+            photo_to_gcs_url = {img.photo_name: img.gcs_url for img in cached_result}
+            
+            # Update image_urls with GCS URLs in the same order as photo_names
+            new_image_urls = []
+            new_images = []
+            new_photo_names = []
+            
+            for i, pn in enumerate(photo_names):
+                gcs_url = photo_to_gcs_url.get(pn)
+                if gcs_url:
+                    new_image_urls.append(gcs_url)
+                    new_images.append(images[i])
+                    new_photo_names.append(pn)
+                else:
+                    print(f"[WARNING] No GCS URL for photo {pn[:50]}...")
+            
+            images = new_images
+            image_urls = new_image_urls
+            photo_names = new_photo_names
+            print(f"[DEBUG] ✅ Updated {len(image_urls)} image URLs to use GCS URLs")
+            
         except Exception as e:
-            # Log error but don't fail the request
-            print(f"Warning: Failed to cache images: {str(e)}")
+            # Log error - this is a critical failure, images won't work without GCS URLs
+            import traceback
+            print(f"[ERROR] Failed to cache images to GCS: {str(e)}")
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
+            raise PlacesServiceError(f"Failed to upload images to GCS: {str(e)}")
+    else:
+        # No database session - can't cache, so we can't get proper URLs
+        raise PlacesServiceError("Database session required to cache images to GCS")
+    
+    if not images or not image_urls:
+        raise PlacesServiceError("Failed to cache any images to GCS")
     
     return images, image_urls, photo_names
 

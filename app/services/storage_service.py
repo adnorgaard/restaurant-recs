@@ -80,11 +80,14 @@ def upload_image_to_gcs(
         blob = bucket.blob(bucket_path)
         blob.upload_from_string(image_bytes, content_type=content_type)
         
-        # Make the blob publicly accessible
-        blob.make_public()
-        
-        # Get the public URL
-        public_url = blob.public_url
+        # For buckets with uniform bucket-level access, we can't use make_public()
+        # Instead, construct the public URL directly (bucket must be configured for public access)
+        try:
+            blob.make_public()
+            public_url = blob.public_url
+        except Exception:
+            # Bucket has uniform access - construct URL directly
+            public_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{bucket_path}"
         
         return public_url, bucket_path
         
@@ -107,18 +110,8 @@ def get_public_url(bucket_path: str) -> str:
     if not GCS_BUCKET_NAME:
         raise StorageServiceError("GCS_BUCKET_NAME environment variable is not set")
     
-    try:
-        client = get_storage_client()
-        bucket = client.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(bucket_path)
-        
-        # Ensure it's public
-        if not blob.public_url:
-            blob.make_public()
-        
-        return blob.public_url
-    except Exception as e:
-        raise StorageServiceError(f"Failed to get public URL: {str(e)}")
+    # For buckets with uniform bucket-level access, just construct the URL directly
+    return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{bucket_path}"
 
 
 def delete_image_from_gcs(bucket_path: str) -> None:

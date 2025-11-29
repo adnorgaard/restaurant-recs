@@ -82,10 +82,11 @@ Respond with ONLY the category name, nothing else."""
 
 def categorize_images(images: List[bytes], db: Optional[Session] = None, place_id: Optional[str] = None, photo_names: Optional[List[str]] = None) -> List[Tuple[bytes, str]]:
     """
-    Categorize a list of images.
+    Categorize a list of images. Uses cached categories when available.
+    Only calls AI for images that have actual bytes AND don't have cached categories.
     
     Args:
-        images: List of image bytes
+        images: List of image bytes (can be empty bytes b"" for cached images)
         db: Optional database session to store categories
         place_id: Optional place_id for storing categories in database
         photo_names: Optional list of photo_names corresponding to images (must match length)
@@ -93,27 +94,74 @@ def categorize_images(images: List[bytes], db: Optional[Session] = None, place_i
     Returns:
         List of tuples (image_bytes, category)
     """
-    categorized = []
-    for idx, img_bytes in enumerate(images):
-        category = categorize_image(img_bytes)
-        categorized.append((img_bytes, category))
-    
-    # Store categories in database if db and place_id are provided
+    # Check for cached categories first
+    cached_categories = {}
     if db and place_id and photo_names and len(photo_names) == len(images):
+        try:
+            from app.services.database_service import get_cached_categories_and_tags
+            cached_categories, _ = get_cached_categories_and_tags(db, place_id, photo_names)
+            print(f"[DEBUG] Found {len(cached_categories)} cached categories")
+        except Exception as e:
+            print(f"Warning: Failed to get cached categories: {str(e)}")
+    
+    categorized = []
+    images_to_categorize = []
+    indices_to_categorize = []
+    
+    # First pass: use cached categories where available
+    for idx, img_bytes in enumerate(images):
+        photo_name = photo_names[idx] if photo_names and idx < len(photo_names) else None
+        
+        # Check if we have a cached category
+        if photo_name and photo_name in cached_categories and cached_categories[photo_name]:
+            # Use cached category
+            category = cached_categories[photo_name]
+            categorized.append((img_bytes, category))
+            print(f"[DEBUG] Using cached category for image {idx}: {category}")
+        else:
+            # Need to categorize this image
+            # Only add to categorization queue if we have actual image bytes
+            if img_bytes and len(img_bytes) > 0:
+                categorized.append((img_bytes, "pending"))  # Placeholder
+                images_to_categorize.append((idx, img_bytes))
+                indices_to_categorize.append(idx)
+            else:
+                # No bytes and no cached category - default to "other"
+                categorized.append((img_bytes, "other"))
+                print(f"[WARNING] Image {idx} has no bytes and no cached category, defaulting to 'other'")
+    
+    # Second pass: categorize images that don't have cached categories
+    if images_to_categorize:
+        print(f"[DEBUG] Categorizing {len(images_to_categorize)} images with AI...")
+        for idx, img_bytes in images_to_categorize:
+            category = categorize_image(img_bytes)
+            categorized[idx] = (img_bytes, category)
+            print(f"[DEBUG] AI categorized image {idx} as: {category}")
+    
+    # Store new categories in database if db and place_id are provided
+    if db and place_id and photo_names and len(photo_names) == len(images) and indices_to_categorize:
         try:
             from app.services.database_service import get_cached_images, update_image_tags
             cached_images = get_cached_images(db, place_id)
+            print(f"[DEBUG] Storing {len(indices_to_categorize)} new categories to database")
             
             # Create a mapping of photo_name to cached image
             photo_to_image = {img.photo_name: img for img in cached_images}
             
-            # Update categories for matching images
-            for photo_name, (_, category) in zip(photo_names, categorized):
-                if photo_name in photo_to_image:
-                    update_image_tags(db, photo_to_image[photo_name].id, category=category)
+            # Update categories for newly categorized images
+            updated_count = 0
+            for idx in indices_to_categorize:
+                if idx < len(photo_names) and idx < len(categorized):
+                    photo_name = photo_names[idx]
+                    _, category = categorized[idx]
+                    if photo_name in photo_to_image:
+                        update_image_tags(db, photo_to_image[photo_name].id, category=category)
+                        updated_count += 1
+            print(f"[DEBUG] Successfully stored {updated_count} categories to database")
         except Exception as e:
-            # Log error but don't fail categorization
-            print(f"Warning: Failed to store categories in database: {str(e)}")
+            import traceback
+            print(f"[ERROR] Failed to store categories in database: {str(e)}")
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
     
     return categorized
 
@@ -121,6 +169,7 @@ def categorize_images(images: List[bytes], db: Optional[Session] = None, place_i
 def select_diverse_images(categorized_images: List[Tuple[bytes, str]], max_images: int = 5, randomize: bool = True) -> Tuple[List[bytes], List[int]]:
     """
     Select diverse images from different categories, prioritizing category diversity.
+    Ensures no duplicate indices are returned.
     
     Since Google Places API doesn't specify photo ordering (could be random, 
     popularity-based, or recency-based - we don't know), we randomize selection
@@ -132,19 +181,23 @@ def select_diverse_images(categorized_images: List[Tuple[bytes, str]], max_image
         randomize: If True, randomly select from each category instead of always first
         
     Returns:
-        Tuple of (selected image bytes, selected indices)
+        Tuple of (selected image bytes, selected indices) - indices are unique
     """
     import random
     
     # Group images by category with their indices
     by_category = {}
     for idx, (img_bytes, category) in enumerate(categorized_images):
+        # Normalize category - treat None, empty, or "pending" as "other"
+        if not category or category == "pending":
+            category = "other"
         if category not in by_category:
             by_category[category] = []
         by_category[category].append((idx, img_bytes))
     
+    print(f"[DEBUG] select_diverse_images: categories found: {list(by_category.keys())}, counts: {[(k, len(v)) for k, v in by_category.items()]}")
+    
     # Shuffle images within each category if randomize is True
-    # This helps avoid bias toward whatever order Google returns them in
     if randomize:
         for category in by_category:
             random.shuffle(by_category[category])
@@ -153,45 +206,45 @@ def select_diverse_images(categorized_images: List[Tuple[bytes, str]], max_image
     category_priority = ["interior", "food", "exterior", "bar", "menu", "other"]
     
     selected = []
-    selected_indices = []
-    categories_used = set()
+    selected_indices = set()  # Use set to prevent duplicates
+    selected_indices_ordered = []  # Keep order
     
     # First pass: try to get at least one from each priority category
     for category in category_priority:
-        if category in by_category and len(selected) < max_images:
-            idx, img_bytes = by_category[category][0]
-            selected.append(img_bytes)
-            selected_indices.append(idx)
-            categories_used.add(category)
-            # Remove used image
-            by_category[category] = by_category[category][1:]
+        if category in by_category and len(selected_indices) < max_images:
+            for idx, img_bytes in by_category[category]:
+                if idx not in selected_indices:
+                    selected.append(img_bytes)
+                    selected_indices.add(idx)
+                    selected_indices_ordered.append(idx)
+                    break
     
-    # Second pass: fill remaining slots with diverse categories
+    # Second pass: fill remaining slots with more images from priority categories
     for category in category_priority:
-        if len(selected) >= max_images:
+        if len(selected_indices) >= max_images:
             break
-        if category in by_category and by_category[category]:
-            idx, img_bytes = by_category[category][0]
-            selected.append(img_bytes)
-            selected_indices.append(idx)
-            by_category[category] = by_category[category][1:]
+        for idx, img_bytes in by_category.get(category, []):
+            if idx not in selected_indices and len(selected_indices) < max_images:
+                selected.append(img_bytes)
+                selected_indices.add(idx)
+                selected_indices_ordered.append(idx)
     
-    # Third pass: fill any remaining slots with any available images
-    for category in category_priority:
-        if len(selected) >= max_images:
-            break
-        while by_category.get(category) and len(selected) < max_images:
-            idx, img_bytes = by_category[category][0]
-            selected.append(img_bytes)
-            selected_indices.append(idx)
-            by_category[category] = by_category[category][1:]
+    # Fallback: if we still don't have enough, take any remaining
+    if len(selected_indices) < max_images:
+        for idx, (img_bytes, _) in enumerate(categorized_images):
+            if idx not in selected_indices and len(selected_indices) < max_images:
+                selected.append(img_bytes)
+                selected_indices.add(idx)
+                selected_indices_ordered.append(idx)
     
     if not selected:
-        # Fallback: just take first N images
+        # Ultimate fallback: just take first N images
         selected = [img for img, _ in categorized_images[:max_images]]
-        selected_indices = list(range(min(len(categorized_images), max_images)))
+        selected_indices_ordered = list(range(min(len(categorized_images), max_images)))
     
-    return selected, selected_indices
+    print(f"[DEBUG] select_diverse_images: selected {len(selected_indices_ordered)} unique indices: {selected_indices_ordered}")
+    
+    return selected, selected_indices_ordered
 
 
 def analyze_restaurant_images(images: List[bytes], db: Optional[Session] = None, place_id: Optional[str] = None, photo_names: Optional[List[str]] = None) -> Dict[str, any]:
@@ -286,6 +339,22 @@ Respond in the following JSON format:
             if not isinstance(result["tags"], list):
                 result["tags"] = [result["tags"]]
             
+            # Store AI tags and description in database if db and place_id are provided
+            if db and place_id and photo_names and len(photo_names) == len(images):
+                try:
+                    from app.services.database_service import store_ai_tags_for_images, store_restaurant_description
+                    # Store the same tags for all analyzed images
+                    image_ai_tags = [(photo_name, result["tags"]) for photo_name in photo_names]
+                    store_ai_tags_for_images(db, place_id, image_ai_tags)
+                    # Store the AI-generated description on the restaurant
+                    store_restaurant_description(db, place_id, result["description"])
+                    print(f"[DEBUG] ✅ Stored AI tags and description for {len(photo_names)} images")
+                except Exception as e:
+                    # Log error but don't fail analysis
+                    import traceback
+                    print(f"[ERROR] Failed to store AI analysis in database: {str(e)}")
+                    print(f"[ERROR] Traceback: {traceback.format_exc()}")
+            
             return {
                 "tags": result["tags"],
                 "description": result["description"]
@@ -317,17 +386,21 @@ Respond in the following JSON format:
                 "description": description if description else content
             }
             
-            # Store AI tags in database if db and place_id are provided
+            # Store AI tags and description in database if db and place_id are provided
             if db and place_id and photo_names and len(photo_names) == len(images):
                 try:
-                    from app.services.database_service import store_ai_tags_for_images
+                    from app.services.database_service import store_ai_tags_for_images, store_restaurant_description
                     # Store the same tags for all analyzed images
-                    # In a more sophisticated implementation, you might analyze each image separately
                     image_ai_tags = [(photo_name, result["tags"]) for photo_name in photo_names]
                     store_ai_tags_for_images(db, place_id, image_ai_tags)
+                    # Store the AI-generated description on the restaurant
+                    store_restaurant_description(db, place_id, result["description"])
+                    print(f"[DEBUG] ✅ Stored AI tags and description (fallback) for {len(photo_names)} images")
                 except Exception as e:
                     # Log error but don't fail analysis
-                    print(f"Warning: Failed to store AI tags in database: {str(e)}")
+                    import traceback
+                    print(f"[ERROR] Failed to store AI analysis in database: {str(e)}")
+                    print(f"[ERROR] Traceback: {traceback.format_exc()}")
             
             return result
             
