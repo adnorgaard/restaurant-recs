@@ -1,7 +1,30 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, UniqueConstraint, Index, Float, Boolean
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, UniqueConstraint, Index, Float, Boolean, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
+
+
+class PromptVersion(Base):
+    """Tracks versions of AI prompts for auditing and version control."""
+    __tablename__ = "prompt_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    component = Column(String, nullable=False, index=True)  # "category", "tags", "description", "embedding"
+    version = Column(String, nullable=False)  # e.g., "v1.0"
+    prompt_text = Column(Text, nullable=True)  # The full prompt used
+    model = Column(String, nullable=True)  # e.g., "gpt-4o", "text-embedding-3-small"
+    notes = Column(Text, nullable=True)  # Optional changelog notes
+    is_active = Column(Boolean, default=True, nullable=False)  # Whether this is the current active version
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('component', 'version', name='uq_component_version'),
+        Index('idx_component', 'component'),
+        Index('idx_is_active', 'is_active'),
+    )
+
+    def __repr__(self):
+        return f"<PromptVersion(component='{self.component}', version='{self.version}', is_active={self.is_active})>"
 
 
 class Restaurant(Base):
@@ -14,6 +37,12 @@ class Restaurant(Base):
     embedding = Column(JSON, nullable=True)  # Vector embedding for semantic search (stored as JSON array)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    # Version tracking for AI-generated content
+    description_version = Column(String, nullable=True)  # e.g., "v1.0"
+    description_updated_at = Column(DateTime(timezone=True), nullable=True)
+    embedding_version = Column(String, nullable=True)  # e.g., "v1.0"
+    embedding_updated_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationship to images
     images = relationship("RestaurantImage", back_populates="restaurant", cascade="all, delete-orphan")
@@ -36,6 +65,12 @@ class RestaurantImage(Base):
     ai_tags = Column(JSON, nullable=True)  # AI-generated tags as JSON array
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    # Version tracking for AI-generated content
+    category_version = Column(String, nullable=True)  # e.g., "v1.0"
+    category_updated_at = Column(DateTime(timezone=True), nullable=True)
+    tags_version = Column(String, nullable=True)  # e.g., "v1.0"
+    tags_updated_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationship to restaurant
     restaurant = relationship("Restaurant", back_populates="images")
