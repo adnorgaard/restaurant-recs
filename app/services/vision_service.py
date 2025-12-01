@@ -13,6 +13,9 @@ load_dotenv(dotenv_path=env_path)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Import version configuration
+from app.config.ai_versions import CATEGORY_VERSION, TAGS_VERSION, DESCRIPTION_VERSION
+
 
 class VisionServiceError(Exception):
     """Custom exception for Vision API errors"""
@@ -40,8 +43,9 @@ def categorize_image(image_bytes: bytes) -> str:
 - "interior": Inside the restaurant, dining area, seating, ambiance
 - "exterior": Outside facade, entrance, building exterior, storefront
 - "food": Food dishes, plates, individual menu items, close-up of food
+- "drink": Beverages, cocktails, wine glasses, coffee, drinks (product shots)
+- "bar": Bar area, bar counter, bartending station, bar seating (the space, not drinks)
 - "menu": Menu boards, printed menus, menu displays
-- "bar": Bar area, drinks, bartending, bar seating
 - "other": Anything else that doesn't fit the above
 
 Respond with ONLY the category name, nothing else."""
@@ -70,7 +74,7 @@ Respond with ONLY the category name, nothing else."""
         category = response.choices[0].message.content.strip().lower()
         
         # Validate category
-        valid_categories = ["interior", "exterior", "food", "menu", "bar", "other"]
+        valid_categories = ["interior", "exterior", "food", "drink", "bar", "menu", "other"]
         if category not in valid_categories:
             return "other"
         
@@ -80,20 +84,54 @@ Respond with ONLY the category name, nothing else."""
         return "other"
 
 
-def categorize_images(images: List[bytes], db: Optional[Session] = None, place_id: Optional[str] = None, photo_names: Optional[List[str]] = None) -> List[Tuple[bytes, str]]:
+def categorize_images(
+    images: List[bytes], 
+    db: Optional[Session] = None, 
+    place_id: Optional[str] = None, 
+    photo_names: Optional[List[str]] = None,
+    cache_quota: Optional[Dict[str, int]] = None,
+    max_bar: int = 2
+) -> List[Tuple[bytes, str]]:
     """
     Categorize a list of images. Uses cached categories when available.
     Only calls AI for images that have actual bytes AND don't have cached categories.
+    
+    Implements "stop when quota met" optimization - stops categorizing once we have
+    enough images in each valid category to meet the cache quota.
     
     Args:
         images: List of image bytes (can be empty bytes b"" for cached images)
         db: Optional database session to store categories
         place_id: Optional place_id for storing categories in database
         photo_names: Optional list of photo_names corresponding to images (must match length)
+        cache_quota: Target quota per category. Default: {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        max_bar: Maximum bar images (count toward interior quota)
         
     Returns:
         List of tuples (image_bytes, category)
     """
+    # Default cache quota: 2 exterior, 8 interior, 8 food, 2 drink = 20 total
+    if cache_quota is None:
+        cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+    
+    # Valid categories we want to cache (excludes menu, other)
+    valid_categories = {"exterior", "interior", "food", "drink", "bar"}
+    
+    # Track category counts for quota optimization
+    category_counts = {cat: 0 for cat in cache_quota}
+    category_counts["bar"] = 0  # Track bar separately
+    
+    def is_quota_met() -> bool:
+        """Check if we've met the quota for all categories."""
+        for cat, target in cache_quota.items():
+            current = category_counts.get(cat, 0)
+            # Bar counts toward interior
+            if cat == "interior":
+                current += min(category_counts.get("bar", 0), max_bar)
+            if current < target:
+                return False
+        return True
+    
     # Check for cached categories first
     cached_categories = {}
     if db and place_id and photo_names and len(photo_names) == len(images):
@@ -108,54 +146,77 @@ def categorize_images(images: List[bytes], db: Optional[Session] = None, place_i
     images_to_categorize = []
     indices_to_categorize = []
     
-    # First pass: use cached categories where available
+    # First pass: use cached categories where available and count them
     for idx, img_bytes in enumerate(images):
         photo_name = photo_names[idx] if photo_names and idx < len(photo_names) else None
         
         # Check if we have a cached category
         if photo_name and photo_name in cached_categories and cached_categories[photo_name]:
-            # Use cached category
             category = cached_categories[photo_name]
             categorized.append((img_bytes, category))
+            # Count valid categories
+            if category in valid_categories:
+                category_counts[category] = category_counts.get(category, 0) + 1
             print(f"[DEBUG] Using cached category for image {idx}: {category}")
         else:
             # Need to categorize this image
-            # Only add to categorization queue if we have actual image bytes
             if img_bytes and len(img_bytes) > 0:
                 categorized.append((img_bytes, "pending"))  # Placeholder
                 images_to_categorize.append((idx, img_bytes))
                 indices_to_categorize.append(idx)
             else:
-                # No bytes and no cached category - default to "other"
                 categorized.append((img_bytes, "other"))
                 print(f"[WARNING] Image {idx} has no bytes and no cached category, defaulting to 'other'")
     
+    print(f"[DEBUG] Category counts from cache: {category_counts}")
+    
     # Second pass: categorize images that don't have cached categories
+    # Stop early once quota is met (cost optimization)
+    actually_categorized = []
     if images_to_categorize:
-        print(f"[DEBUG] Categorizing {len(images_to_categorize)} images with AI...")
+        print(f"[DEBUG] Need to categorize {len(images_to_categorize)} images with AI...")
         for idx, img_bytes in images_to_categorize:
+            # Check if quota is already met
+            if is_quota_met():
+                print(f"[DEBUG] ✅ Quota met! Stopping categorization early (saved {len(images_to_categorize) - len(actually_categorized)} API calls)")
+                # Mark remaining images as "skipped" (won't be cached)
+                categorized[idx] = (img_bytes, "skipped")
+                continue
+            
             category = categorize_image(img_bytes)
             categorized[idx] = (img_bytes, category)
-            print(f"[DEBUG] AI categorized image {idx} as: {category}")
+            actually_categorized.append(idx)
+            
+            # Count valid categories
+            if category in valid_categories:
+                category_counts[category] = category_counts.get(category, 0) + 1
+            
+            print(f"[DEBUG] AI categorized image {idx} as: {category} (counts: {category_counts})")
+        
+        print(f"[DEBUG] Categorized {len(actually_categorized)} images with AI")
     
     # Store new categories in database if db and place_id are provided
-    if db and place_id and photo_names and len(photo_names) == len(images) and indices_to_categorize:
+    # Only store images that were actually categorized (not skipped)
+    if db and place_id and photo_names and len(photo_names) == len(images) and actually_categorized:
         try:
             from app.services.database_service import get_cached_images, update_image_tags
             cached_images = get_cached_images(db, place_id)
-            print(f"[DEBUG] Storing {len(indices_to_categorize)} new categories to database")
+            print(f"[DEBUG] Storing {len(actually_categorized)} new categories to database (version: {CATEGORY_VERSION})")
             
-            # Create a mapping of photo_name to cached image
             photo_to_image = {img.photo_name: img for img in cached_images}
             
-            # Update categories for newly categorized images
             updated_count = 0
-            for idx in indices_to_categorize:
+            for idx in actually_categorized:
                 if idx < len(photo_names) and idx < len(categorized):
                     photo_name = photo_names[idx]
                     _, category = categorized[idx]
-                    if photo_name in photo_to_image:
-                        update_image_tags(db, photo_to_image[photo_name].id, category=category)
+                    if photo_name in photo_to_image and category != "skipped":
+                        update_image_tags(
+                            db, 
+                            photo_to_image[photo_name].id, 
+                            category=category,
+                            category_version=CATEGORY_VERSION
+                        )
                         updated_count += 1
             print(f"[DEBUG] Successfully stored {updated_count} categories to database")
         except Exception as e:
@@ -247,6 +308,144 @@ def select_diverse_images(categorized_images: List[Tuple[bytes, str]], max_image
     return selected, selected_indices_ordered
 
 
+def select_images_by_quota(
+    categorized_images: List[Tuple[bytes, str]], 
+    quota: Optional[Dict[str, int]] = None,
+    max_bar: int = 2,
+    randomize: bool = False
+) -> Tuple[List[bytes], List[int]]:
+    """
+    Select images based on specific quotas per category.
+    Default quota: 2 exterior, 8 interior, 8 food, 2 drink = 20 total.
+    
+    Rules:
+    - Bar counts as interior (max 2 bar images allowed by default)
+    - Menu and "other" images are excluded entirely
+    - If a category doesn't have enough images, remaining slots are filled
+      from other valid categories (food, interior, exterior, drink, bar)
+    
+    Args:
+        categorized_images: List of (image_bytes, category) tuples
+        quota: Dict mapping category to desired count. 
+               Default: {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        max_bar: Maximum number of bar images allowed (counts toward interior)
+        randomize: If True, randomly select within each category
+        
+    Returns:
+        Tuple of (selected image bytes, selected indices) - indices are unique
+    """
+    import random
+    
+    # Default quota: 2 exterior, 8 interior, 8 food, 2 drink = 20 total
+    if quota is None:
+        quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+    
+    total_quota = sum(quota.values())
+    
+    # Excluded categories - never select these
+    excluded_categories = {"menu", "other", "skipped"}
+    
+    # Group images by category with their indices
+    by_category = {}
+    for idx, (img_bytes, category) in enumerate(categorized_images):
+        # Normalize category - treat None, empty, or "pending" as "other"
+        if not category or category == "pending":
+            category = "other"
+        category = category.lower()
+        
+        # Skip excluded categories
+        if category in excluded_categories:
+            continue
+            
+        if category not in by_category:
+            by_category[category] = []
+        by_category[category].append((idx, img_bytes))
+    
+    print(f"[DEBUG] select_images_by_quota: categories found: {list(by_category.keys())}, counts: {[(k, len(v)) for k, v in by_category.items()]}")
+    print(f"[DEBUG] select_images_by_quota: quota requested: {quota}")
+    
+    # Shuffle images within each category if randomize is True
+    if randomize:
+        for category in by_category:
+            random.shuffle(by_category[category])
+    
+    selected = []
+    selected_indices = set()
+    selected_indices_ordered = []
+    bar_count = 0  # Track bar images
+    
+    # Track remaining slots that couldn't be filled from primary categories
+    remaining_slots = 0
+    
+    # First pass: fill quotas from specified categories
+    for category, count in quota.items():
+        category_lower = category.lower()
+        available = by_category.get(category_lower, [])
+        added = 0
+        
+        for idx, img_bytes in available:
+            if idx not in selected_indices and added < count:
+                selected.append(img_bytes)
+                selected_indices.add(idx)
+                selected_indices_ordered.append(idx)
+                added += 1
+        
+        # Track how many slots couldn't be filled
+        remaining_slots += (count - added)
+        
+        if added < count:
+            print(f"[DEBUG] select_images_by_quota: {category} only had {added}/{count} images")
+    
+    # Second pass: fill remaining interior slots with bar (bar counts as interior)
+    interior_shortfall = quota.get("interior", 0) - len([
+        idx for idx in selected_indices_ordered 
+        if idx < len(categorized_images) and categorized_images[idx][1] and categorized_images[idx][1].lower() == "interior"
+    ])
+    
+    if interior_shortfall > 0 and bar_count < max_bar:
+        for idx, img_bytes in by_category.get("bar", []):
+            if idx not in selected_indices and bar_count < max_bar and interior_shortfall > 0:
+                selected.append(img_bytes)
+                selected_indices.add(idx)
+                selected_indices_ordered.append(idx)
+                bar_count += 1
+                remaining_slots -= 1
+                interior_shortfall -= 1
+                print(f"[DEBUG] select_images_by_quota: using bar image as interior ({bar_count}/{max_bar})")
+    
+    # Third pass: fill remaining slots from ANY valid category that has extra images
+    # This handles cases where some categories have more than their quota
+    if remaining_slots > 0:
+        # Prioritize categories that might have extras beyond their quota
+        fallback_priority = ["food", "interior", "exterior", "drink", "bar"]
+        
+        for category in fallback_priority:
+            if remaining_slots <= 0:
+                break
+            # For bar, still respect the max_bar limit
+            if category == "bar":
+                for idx, img_bytes in by_category.get(category, []):
+                    if idx not in selected_indices and remaining_slots > 0 and bar_count < max_bar:
+                        selected.append(img_bytes)
+                        selected_indices.add(idx)
+                        selected_indices_ordered.append(idx)
+                        bar_count += 1
+                        remaining_slots -= 1
+            else:
+                for idx, img_bytes in by_category.get(category, []):
+                    if idx not in selected_indices and remaining_slots > 0:
+                        selected.append(img_bytes)
+                        selected_indices.add(idx)
+                        selected_indices_ordered.append(idx)
+                        remaining_slots -= 1
+    
+    # Log what we actually selected
+    total_available = sum(len(v) for v in by_category.values())
+    print(f"[DEBUG] select_images_by_quota: selected {len(selected_indices_ordered)}/{total_available} available valid images")
+    
+    return selected, selected_indices_ordered
+
+
 def analyze_restaurant_images(images: List[bytes], db: Optional[Session] = None, place_id: Optional[str] = None, photo_names: Optional[List[str]] = None) -> Dict[str, any]:
     """
     Analyze restaurant images using OpenAI GPT-4 Vision to generate tags and description.
@@ -284,21 +483,17 @@ def analyze_restaurant_images(images: List[bytes], db: Optional[Session] = None,
     
     # Create prompt for restaurant classification
     prompt = """Analyze these restaurant images and provide:
-1. A list of relevant tags/categories (e.g., "cozy", "upscale", "family-friendly", "italian", "romantic", "casual", "outdoor seating", "modern", "traditional", etc.)
-2. A natural language description of the restaurant's ambiance, style, and characteristics
 
-Focus on:
-- Ambiance and atmosphere
-- Cuisine type/style
-- Price level indicators
-- Decor and interior design
-- Target audience
-- Special features (outdoor seating, bar, etc.)
+1. TAGS: Generate 4-10 simple, single-word or short-phrase tags that describe this restaurant.
+   Focus on: cuisine type, atmosphere, and one or two standout features.
+   Keep tags concise and easy to scan.
 
-Respond in the following JSON format:
+2. DESCRIPTION: Write a 2-3 sentence summary capturing the restaurant's essence, vibe, and what makes it special. Be evocative but natural.
+
+Respond in JSON format:
 {
-    "tags": ["tag1", "tag2", "tag3"],
-    "description": "A detailed description of the restaurant..."
+    "tags": ["tag1", "tag2", ...],
+    "description": "2-3 sentence summary..."
 }"""
 
     try:
@@ -343,12 +538,12 @@ Respond in the following JSON format:
             if db and place_id and photo_names and len(photo_names) == len(images):
                 try:
                     from app.services.database_service import store_ai_tags_for_images, store_restaurant_description
-                    # Store the same tags for all analyzed images
+                    # Store the same tags for all analyzed images (with version tracking)
                     image_ai_tags = [(photo_name, result["tags"]) for photo_name in photo_names]
-                    store_ai_tags_for_images(db, place_id, image_ai_tags)
-                    # Store the AI-generated description on the restaurant
-                    store_restaurant_description(db, place_id, result["description"])
-                    print(f"[DEBUG] ✅ Stored AI tags and description for {len(photo_names)} images")
+                    store_ai_tags_for_images(db, place_id, image_ai_tags, version=TAGS_VERSION)
+                    # Store the AI-generated description on the restaurant (with version tracking)
+                    store_restaurant_description(db, place_id, result["description"], version=DESCRIPTION_VERSION)
+                    print(f"[DEBUG] ✅ Stored AI tags (v{TAGS_VERSION}) and description (v{DESCRIPTION_VERSION}) for {len(photo_names)} images")
                 except Exception as e:
                     # Log error but don't fail analysis
                     import traceback
@@ -390,12 +585,12 @@ Respond in the following JSON format:
             if db and place_id and photo_names and len(photo_names) == len(images):
                 try:
                     from app.services.database_service import store_ai_tags_for_images, store_restaurant_description
-                    # Store the same tags for all analyzed images
+                    # Store the same tags for all analyzed images (with version tracking)
                     image_ai_tags = [(photo_name, result["tags"]) for photo_name in photo_names]
-                    store_ai_tags_for_images(db, place_id, image_ai_tags)
-                    # Store the AI-generated description on the restaurant
-                    store_restaurant_description(db, place_id, result["description"])
-                    print(f"[DEBUG] ✅ Stored AI tags and description (fallback) for {len(photo_names)} images")
+                    store_ai_tags_for_images(db, place_id, image_ai_tags, version=TAGS_VERSION)
+                    # Store the AI-generated description on the restaurant (with version tracking)
+                    store_restaurant_description(db, place_id, result["description"], version=DESCRIPTION_VERSION)
+                    print(f"[DEBUG] ✅ Stored AI tags (v{TAGS_VERSION}) and description (v{DESCRIPTION_VERSION}) (fallback) for {len(photo_names)} images")
                 except Exception as e:
                     # Log error but don't fail analysis
                     import traceback

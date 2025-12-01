@@ -1,7 +1,8 @@
 from typing import List, Optional, Tuple, Dict
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from app.models.database import Restaurant, RestaurantImage
+from app.models.database import Restaurant, RestaurantImage, PromptVersion
 from app.services.storage_service import (
     upload_image_to_gcs,
     StorageServiceError,
@@ -136,8 +137,9 @@ def cache_images(
             ).first()
             
             if existing_image:
-                # Update category if it's different
-                if existing_image.category != category and category is not None:
+                # Don't overwrite existing categories - preserve what's already cached
+                # Only set category if it was previously None/empty
+                if not existing_image.category and category is not None:
                     existing_image.category = category
                     db.commit()
                     db.refresh(existing_image)
@@ -172,8 +174,8 @@ def cache_images(
             
             if existing_by_path:
                 # GCS path already has a record - this is a content duplicate
-                # Update category if needed and return existing record
-                if existing_by_path.category != category and category is not None:
+                # Don't overwrite existing categories - preserve what's already cached
+                if not existing_by_path.category and category is not None:
                     existing_by_path.category = category
                     db.commit()
                     db.refresh(existing_by_path)
@@ -307,7 +309,9 @@ def update_image_tags(
     db: Session,
     image_id: int,
     category: Optional[str] = None,
-    ai_tags: Optional[List[str]] = None
+    ai_tags: Optional[List[str]] = None,
+    category_version: Optional[str] = None,
+    tags_version: Optional[str] = None
 ) -> RestaurantImage:
     """
     Update category and/or AI tags for a specific image.
@@ -317,6 +321,8 @@ def update_image_tags(
         image_id: ID of the image to update
         category: Optional new category value
         ai_tags: Optional new AI tags list
+        category_version: Version of the categorization logic used
+        tags_version: Version of the tagging logic used
         
     Returns:
         Updated RestaurantImage instance
@@ -330,13 +336,21 @@ def update_image_tags(
         if not image:
             raise DatabaseServiceError(f"Image with id {image_id} not found")
         
+        now = datetime.now(timezone.utc)
+        
         # Update category if provided
         if category is not None:
             image.category = category
+            if category_version:
+                image.category_version = category_version
+                image.category_updated_at = now
         
         # Update AI tags if provided
         if ai_tags is not None:
             image.ai_tags = ai_tags
+            if tags_version:
+                image.tags_version = tags_version
+                image.tags_updated_at = now
         
         db.commit()
         db.refresh(image)
@@ -367,7 +381,8 @@ def get_image_by_id(db: Session, image_id: int) -> Optional[RestaurantImage]:
 def store_ai_tags_for_images(
     db: Session,
     place_id: str,
-    image_ai_tags: List[Tuple[str, List[str]]]
+    image_ai_tags: List[Tuple[str, List[str]]],
+    version: Optional[str] = None
 ) -> None:
     """
     Store AI-generated tags for images.
@@ -376,6 +391,7 @@ def store_ai_tags_for_images(
         db: Database session
         place_id: Google Places place_id
         image_ai_tags: List of tuples (photo_name, ai_tags_list)
+        version: Version of the tagging logic used
         
     Raises:
         DatabaseServiceError: If operation fails
@@ -395,9 +411,14 @@ def store_ai_tags_for_images(
             RestaurantImage.photo_name.in_(tags_map.keys())
         ).all()
         
+        now = datetime.now(timezone.utc)
+        
         for image in images:
             if image.photo_name in tags_map:
                 image.ai_tags = tags_map[image.photo_name]
+                if version:
+                    image.tags_version = version
+                    image.tags_updated_at = now
         
         db.commit()
         
@@ -435,8 +456,8 @@ def get_cached_categories_and_tags(
         RestaurantImage.photo_name.in_(photo_names)
     ).all()
     
-    # Valid categories
-    valid_categories = {"interior", "exterior", "food", "menu", "bar", "other"}
+    # Valid categories (drink is a valid category now)
+    valid_categories = {"interior", "exterior", "food", "drink", "menu", "bar", "other"}
     
     categories = {}
     ai_tags = {}
@@ -511,7 +532,8 @@ def get_cached_restaurant_analysis(
 def store_restaurant_description(
     db: Session,
     place_id: str,
-    description: str
+    description: str,
+    version: Optional[str] = None
 ) -> None:
     """
     Store the AI-generated description for a restaurant.
@@ -520,14 +542,18 @@ def store_restaurant_description(
         db: Database session
         place_id: Google Places place_id
         description: AI-generated description to store
+        version: Version of the description generation logic used
     """
     try:
         restaurant = db.query(Restaurant).filter(Restaurant.place_id == place_id).first()
         
         if restaurant:
             restaurant.description = description
+            if version:
+                restaurant.description_version = version
+                restaurant.description_updated_at = datetime.now(timezone.utc)
             db.commit()
-            print(f"[CACHE] ✅ Stored AI description for {place_id}")
+            print(f"[CACHE] ✅ Stored AI description for {place_id} (version: {version})")
         else:
             print(f"[CACHE] ❌ Cannot store description - restaurant {place_id} not found")
     except Exception as e:
@@ -600,8 +626,10 @@ def find_restaurant_by_text(
 def get_complete_cached_restaurant_data(
     db: Session,
     place_id: str,
-    max_images: int = 10,
-    max_selected: int = 5
+    max_images: int = 50,
+    max_selected: int = 20,
+    quota: Optional[Dict[str, int]] = None,
+    max_bar: int = 2
 ) -> Optional[Dict]:
     """
     Get complete cached restaurant data including name, images, categories, and AI analysis.
@@ -609,16 +637,33 @@ def get_complete_cached_restaurant_data(
     
     Returns None if ANY required data is missing, triggering the normal flow to fill the cache.
     
+    Rules:
+    - Bar counts as interior (max 2 bar images allowed by default)
+    - Menu, "other", and "skipped" images are excluded entirely
+    - Drink is a valid category
+    
     Args:
         db: Database session
         place_id: Google Places place_id
-        max_images: Maximum number of images to retrieve
-        max_selected: Maximum number of images to select for analysis
+        max_images: Maximum number of images to retrieve from cache
+        max_selected: Maximum number of images to select for display
+        quota: Dict mapping category to desired count.
+               Default: {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        max_bar: Maximum bar images (counts toward interior quota)
         
     Returns:
         Dictionary with 'restaurant_name', 'images', 'image_urls', 'photo_names', 
         'categories', 'analysis', or None if not all data is available
     """
+    # Default quota: 2 exterior, 8 interior, 8 food, 2 drink = 20 total
+    if quota is None:
+        quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+    
+    total_quota = sum(quota.values())
+    
+    # Excluded categories - never select these
+    excluded_categories = {"menu", "other", "skipped"}
+    
     restaurant = db.query(Restaurant).filter(Restaurant.place_id == place_id).first()
     
     if not restaurant:
@@ -628,24 +673,26 @@ def get_complete_cached_restaurant_data(
     # Get cached images
     cached_images = get_cached_images(db, place_id, max_images)
     
-    if not cached_images or len(cached_images) < max_selected:
-        print(f"[CACHE] ❌ Not enough cached images: {len(cached_images) if cached_images else 0} < {max_selected}")
+    if not cached_images:
+        print(f"[CACHE] ❌ No cached images found")
         return None
     
-    # Valid categories for filtering
-    valid_categories = {"interior", "exterior", "food", "menu", "bar", "other"}
+    # Valid categories for selection (excluding menu, other, skipped)
+    valid_categories = {"interior", "exterior", "food", "drink", "bar"}
     
-    # Check that we have enough images with VALID categories
+    # Filter to only valid categories
     images_with_valid_categories = [
         img for img in cached_images 
         if img.category and img.category.strip().lower() in valid_categories
     ]
     
-    if len(images_with_valid_categories) < max_selected:
-        print(f"[CACHE] ❌ Not enough images with valid categories: {len(images_with_valid_categories)} < {max_selected}")
+    # Only require minimum images, not the full quota (restaurant may have fewer photos)
+    min_valid_images = 5
+    if len(images_with_valid_categories) < min_valid_images:
+        print(f"[CACHE] ❌ Not enough valid images: {len(images_with_valid_categories)} < {min_valid_images}")
         return None
     
-    # Group images by category for diverse selection
+    # Group images by category for quota-based selection
     by_category = {}
     for img in images_with_valid_categories:
         category = img.category.lower()
@@ -653,46 +700,94 @@ def get_complete_cached_restaurant_data(
             by_category[category] = []
         by_category[category].append(img)
     
-    # Select diverse images (deterministic selection for consistent results)
-    category_priority = ["interior", "food", "exterior", "bar", "menu", "other"]
+    print(f"[CACHE] Categories available: {[(k, len(v)) for k, v in by_category.items()]}")
+    
+    # Select images based on quota (2 exterior, 8 food, 8 interior, 2 drink)
+    # Bar counts as interior (max 2 bar allowed)
     selected_images = []
     selected_indices = set()  # Prevent duplicates
+    remaining_slots = 0
+    bar_count = 0
     
-    # First pass: get one from each priority category
-    for category in category_priority:
-        if category in by_category and len(selected_images) < max_selected:
-            for img in by_category[category]:
-                if img.id not in selected_indices:
-                    selected_images.append(img)
-                    selected_indices.add(img.id)
-                    break
-    
-    # Second pass: fill remaining slots from priority categories
-    for category in category_priority:
-        if len(selected_images) >= max_selected:
-            break
-        for img in by_category.get(category, []):
-            if img.id not in selected_indices and len(selected_images) < max_selected:
+    # First pass: fill quotas from specified categories
+    for category, count in quota.items():
+        category_lower = category.lower()
+        available = by_category.get(category_lower, [])
+        added = 0
+        
+        for img in available:
+            if img.id not in selected_indices and added < count:
                 selected_images.append(img)
                 selected_indices.add(img.id)
+                added += 1
+        
+        remaining_slots += (count - added)
+        
+        if added < count:
+            print(f"[CACHE] {category} only had {added}/{count} images")
     
-    if len(selected_images) < max_selected:
-        print(f"[CACHE] ❌ Could not select enough diverse images: {len(selected_images)} < {max_selected}")
+    # Second pass: fill remaining interior slots with bar (bar counts as interior)
+    interior_shortfall = quota.get("interior", 0) - len([
+        img for img in selected_images if img.category.lower() == "interior"
+    ])
+    
+    if interior_shortfall > 0 and bar_count < max_bar:
+        for img in by_category.get("bar", []):
+            if img.id not in selected_indices and bar_count < max_bar and interior_shortfall > 0:
+                selected_images.append(img)
+                selected_indices.add(img.id)
+                bar_count += 1
+                remaining_slots -= 1
+                interior_shortfall -= 1
+                print(f"[CACHE] Using bar image as interior ({bar_count}/{max_bar})")
+    
+    # Third pass: fill remaining slots from valid fallback categories (no menu/other)
+    if remaining_slots > 0:
+        fallback_priority = ["food", "interior", "exterior", "drink"]
+        
+        for category in fallback_priority:
+            if remaining_slots <= 0:
+                break
+            for img in by_category.get(category, []):
+                if img.id not in selected_indices and remaining_slots > 0:
+                    selected_images.append(img)
+                    selected_indices.add(img.id)
+                    remaining_slots -= 1
+        
+        # Can also use bar if still have remaining slots and haven't used max bar yet
+        if remaining_slots > 0 and bar_count < max_bar:
+            for img in by_category.get("bar", []):
+                if img.id not in selected_indices and remaining_slots > 0 and bar_count < max_bar:
+                    selected_images.append(img)
+                    selected_indices.add(img.id)
+                    bar_count += 1
+                    remaining_slots -= 1
+    
+    # We might not have 20 images if the restaurant doesn't have that many valid photos
+    # That's okay - work with what we have as long as we have at least some
+    min_images_required = 5  # Minimum to provide useful analysis
+    
+    if len(selected_images) < min_images_required:
+        print(f"[CACHE] ❌ Not enough valid images: {len(selected_images)} < {min_images_required}")
         return None
     
-    # Check that all selected images have AI tags
+    if len(selected_images) < total_quota:
+        print(f"[CACHE] ⚠️ Only have {len(selected_images)}/{total_quota} valid images (restaurant may have fewer photos)")
+    
+    # Check that ALL selected images have AI tags (not just 20)
     images_with_ai_tags = [img for img in selected_images if img.ai_tags and len(img.ai_tags) > 0]
     
-    if len(images_with_ai_tags) < max_selected:
-        print(f"[CACHE] ❌ Not enough images with AI tags: {len(images_with_ai_tags)} < {max_selected}")
+    if len(images_with_ai_tags) < len(selected_images):
+        print(f"[CACHE] ❌ Not all images have AI tags: {len(images_with_ai_tags)}/{len(selected_images)}")
         return None
     
-    # Use the selected images (they all have categories and AI tags at this point)
-    final_images = selected_images[:max_selected]
+    # Use all selected images (they all have categories at this point)
+    final_images = selected_images
     selected_photo_names = [img.photo_name for img in final_images]
     
-    # Get cached analysis using these photo_names
-    analysis = get_cached_restaurant_analysis(db, place_id, selected_photo_names)
+    # Get cached analysis - need all photo_names that have AI tags
+    photo_names_with_tags = [img.photo_name for img in images_with_ai_tags]
+    analysis = get_cached_restaurant_analysis(db, place_id, photo_names_with_tags)
     if not analysis:
         print(f"[CACHE] ❌ Failed to construct analysis from cached AI tags")
         return None
@@ -721,4 +816,339 @@ def get_complete_cached_restaurant_data(
         'categories': {img['photo_name']: img['category'] for img in image_metadata},
         'analysis': analysis
     }
+
+
+# =============================================================================
+# Version Tracking Functions
+# =============================================================================
+
+def get_stale_restaurants(
+    db: Session,
+    component: str,
+    current_version: str
+) -> List[Restaurant]:
+    """
+    Get restaurants where the specified component is stale (version < current).
+    
+    Args:
+        db: Database session
+        component: "description" or "embedding"
+        current_version: The current active version to compare against
+        
+    Returns:
+        List of Restaurant instances that need refresh
+        
+    Raises:
+        DatabaseServiceError: If invalid component specified
+    """
+    if component == "description":
+        # Stale if: no version set, or version doesn't match current
+        return db.query(Restaurant).filter(
+            (Restaurant.description_version == None) | 
+            (Restaurant.description_version != current_version)
+        ).all()
+    elif component == "embedding":
+        return db.query(Restaurant).filter(
+            (Restaurant.embedding_version == None) | 
+            (Restaurant.embedding_version != current_version)
+        ).all()
+    else:
+        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'description' or 'embedding'")
+
+
+def get_stale_images(
+    db: Session,
+    component: str,
+    current_version: str
+) -> List[RestaurantImage]:
+    """
+    Get restaurant images where the specified component is stale (version < current).
+    
+    Args:
+        db: Database session
+        component: "category" or "tags"
+        current_version: The current active version to compare against
+        
+    Returns:
+        List of RestaurantImage instances that need refresh
+        
+    Raises:
+        DatabaseServiceError: If invalid component specified
+    """
+    if component == "category":
+        return db.query(RestaurantImage).filter(
+            (RestaurantImage.category_version == None) | 
+            (RestaurantImage.category_version != current_version)
+        ).all()
+    elif component == "tags":
+        return db.query(RestaurantImage).filter(
+            (RestaurantImage.tags_version == None) | 
+            (RestaurantImage.tags_version != current_version)
+        ).all()
+    else:
+        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'category' or 'tags'")
+
+
+def get_restaurants_missing_data(
+    db: Session,
+    component: str
+) -> List[Restaurant]:
+    """
+    Get restaurants that are completely missing data for a component.
+    
+    Args:
+        db: Database session
+        component: "description" or "embedding"
+        
+    Returns:
+        List of Restaurant instances missing the specified data
+    """
+    if component == "description":
+        return db.query(Restaurant).filter(Restaurant.description == None).all()
+    elif component == "embedding":
+        return db.query(Restaurant).filter(Restaurant.embedding == None).all()
+    else:
+        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'description' or 'embedding'")
+
+
+def get_images_missing_data(
+    db: Session,
+    component: str
+) -> List[RestaurantImage]:
+    """
+    Get restaurant images that are completely missing data for a component.
+    
+    Args:
+        db: Database session
+        component: "category" or "tags"
+        
+    Returns:
+        List of RestaurantImage instances missing the specified data
+    """
+    if component == "category":
+        return db.query(RestaurantImage).filter(RestaurantImage.category == None).all()
+    elif component == "tags":
+        return db.query(RestaurantImage).filter(RestaurantImage.ai_tags == None).all()
+    else:
+        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'category' or 'tags'")
+
+
+def get_version_stats(db: Session) -> Dict:
+    """
+    Get statistics about version coverage across all data.
+    
+    Returns:
+        Dict with counts of versioned/unversioned data for each component
+    """
+    stats = {}
+    
+    # Restaurant description stats
+    total_restaurants = db.query(Restaurant).count()
+    with_description = db.query(Restaurant).filter(Restaurant.description != None).count()
+    with_description_version = db.query(Restaurant).filter(Restaurant.description_version != None).count()
+    stats["description"] = {
+        "total": total_restaurants,
+        "with_data": with_description,
+        "with_version": with_description_version,
+        "missing_data": total_restaurants - with_description,
+        "unversioned": with_description - with_description_version,
+    }
+    
+    # Restaurant embedding stats
+    with_embedding = db.query(Restaurant).filter(Restaurant.embedding != None).count()
+    with_embedding_version = db.query(Restaurant).filter(Restaurant.embedding_version != None).count()
+    stats["embedding"] = {
+        "total": total_restaurants,
+        "with_data": with_embedding,
+        "with_version": with_embedding_version,
+        "missing_data": total_restaurants - with_embedding,
+        "unversioned": with_embedding - with_embedding_version,
+    }
+    
+    # Image category stats
+    total_images = db.query(RestaurantImage).count()
+    with_category = db.query(RestaurantImage).filter(RestaurantImage.category != None).count()
+    with_category_version = db.query(RestaurantImage).filter(RestaurantImage.category_version != None).count()
+    stats["category"] = {
+        "total": total_images,
+        "with_data": with_category,
+        "with_version": with_category_version,
+        "missing_data": total_images - with_category,
+        "unversioned": with_category - with_category_version,
+    }
+    
+    # Image tags stats
+    with_tags = db.query(RestaurantImage).filter(RestaurantImage.ai_tags != None).count()
+    with_tags_version = db.query(RestaurantImage).filter(RestaurantImage.tags_version != None).count()
+    stats["tags"] = {
+        "total": total_images,
+        "with_data": with_tags,
+        "with_version": with_tags_version,
+        "missing_data": total_images - with_tags,
+        "unversioned": with_tags - with_tags_version,
+    }
+    
+    return stats
+
+
+# =============================================================================
+# Prompt Version CRUD Functions
+# =============================================================================
+
+def create_prompt_version(
+    db: Session,
+    component: str,
+    version: str,
+    prompt_text: Optional[str] = None,
+    model: Optional[str] = None,
+    notes: Optional[str] = None,
+    set_active: bool = True
+) -> PromptVersion:
+    """
+    Create a new prompt version record.
+    
+    Args:
+        db: Database session
+        component: One of "category", "tags", "description", "embedding"
+        version: Version string, e.g., "v1.1"
+        prompt_text: The full prompt text (optional for embeddings)
+        model: The model used, e.g., "gpt-4o"
+        notes: Optional changelog notes
+        set_active: If True, deactivates other versions for this component
+        
+    Returns:
+        Created PromptVersion instance
+        
+    Raises:
+        DatabaseServiceError: If creation fails
+    """
+    valid_components = {"category", "tags", "description", "embedding"}
+    if component not in valid_components:
+        raise DatabaseServiceError(f"Invalid component: {component}. Must be one of {valid_components}")
+    
+    try:
+        # Deactivate existing versions for this component if setting this one active
+        if set_active:
+            db.query(PromptVersion).filter(
+                PromptVersion.component == component,
+                PromptVersion.is_active == True
+            ).update({"is_active": False})
+        
+        # Create new version
+        prompt_version = PromptVersion(
+            component=component,
+            version=version,
+            prompt_text=prompt_text,
+            model=model,
+            notes=notes,
+            is_active=set_active
+        )
+        db.add(prompt_version)
+        db.commit()
+        db.refresh(prompt_version)
+        
+        return prompt_version
+        
+    except IntegrityError as e:
+        db.rollback()
+        raise DatabaseServiceError(f"Version {version} already exists for component {component}")
+    except Exception as e:
+        db.rollback()
+        raise DatabaseServiceError(f"Failed to create prompt version: {str(e)}")
+
+
+def get_prompt_version(
+    db: Session,
+    component: str,
+    version: Optional[str] = None
+) -> Optional[PromptVersion]:
+    """
+    Get a prompt version record.
+    
+    Args:
+        db: Database session
+        component: One of "category", "tags", "description", "embedding"
+        version: Specific version to get, or None for active version
+        
+    Returns:
+        PromptVersion instance or None if not found
+    """
+    query = db.query(PromptVersion).filter(PromptVersion.component == component)
+    
+    if version:
+        return query.filter(PromptVersion.version == version).first()
+    else:
+        return query.filter(PromptVersion.is_active == True).first()
+
+
+def get_all_prompt_versions(
+    db: Session,
+    component: Optional[str] = None
+) -> List[PromptVersion]:
+    """
+    Get all prompt version records.
+    
+    Args:
+        db: Database session
+        component: Optional filter by component
+        
+    Returns:
+        List of PromptVersion instances
+    """
+    query = db.query(PromptVersion).order_by(
+        PromptVersion.component,
+        PromptVersion.created_at.desc()
+    )
+    
+    if component:
+        query = query.filter(PromptVersion.component == component)
+    
+    return query.all()
+
+
+def set_active_prompt_version(
+    db: Session,
+    component: str,
+    version: str
+) -> PromptVersion:
+    """
+    Set a specific version as the active version for a component.
+    
+    Args:
+        db: Database session
+        component: One of "category", "tags", "description", "embedding"
+        version: Version to activate
+        
+    Returns:
+        Activated PromptVersion instance
+        
+    Raises:
+        DatabaseServiceError: If version not found
+    """
+    try:
+        # Deactivate all versions for this component
+        db.query(PromptVersion).filter(
+            PromptVersion.component == component
+        ).update({"is_active": False})
+        
+        # Activate the specified version
+        prompt_version = db.query(PromptVersion).filter(
+            PromptVersion.component == component,
+            PromptVersion.version == version
+        ).first()
+        
+        if not prompt_version:
+            raise DatabaseServiceError(f"Version {version} not found for component {component}")
+        
+        prompt_version.is_active = True
+        db.commit()
+        db.refresh(prompt_version)
+        
+        return prompt_version
+        
+    except DatabaseServiceError:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise DatabaseServiceError(f"Failed to set active version: {str(e)}")
 
