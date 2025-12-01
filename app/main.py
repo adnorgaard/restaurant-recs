@@ -37,6 +37,7 @@ from app.services.vision_service import (
     analyze_restaurant_images,
     categorize_images,
     select_diverse_images,
+    select_images_by_quota,
     VisionServiceError
 )
 from app.services.database_service import (
@@ -436,11 +437,13 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
             )
         
         # Check for complete cached data first - this allows instant responses
+        # Quota: 2 exterior, 8 food, 8 interior, 2 drink = 20 total
         from app.services.database_service import (
             get_complete_cached_restaurant_data, get_cached_images, 
             get_cached_categories_and_tags, get_cached_restaurant_analysis
         )
-        cached_data = get_complete_cached_restaurant_data(db, place_id, max_images=10, max_selected=5)
+        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        cached_data = get_complete_cached_restaurant_data(db, place_id, max_images=50, max_selected=20, quota=image_quota, max_bar=2)
         
         if cached_data:
             # All data is cached - return immediately without any API calls
@@ -462,16 +465,16 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
         else:
             restaurant_name = get_restaurant_name(place_id)
         
-        # Get or fetch images
-        cached_images = get_cached_images(db, place_id, max_images=10)
+        # Get or fetch images (up to 50 for categorization, display 20)
+        cached_images = get_cached_images(db, place_id, max_images=50)
         
-        if cached_images and len(cached_images) >= 5:
+        if cached_images and len(cached_images) >= 20:
             all_image_urls = [img.gcs_url for img in cached_images]
             photo_names = [img.photo_name for img in cached_images]
         else:
             # Fetch from Places API
-            all_images, all_image_urls, photo_names = get_place_images_with_metadata(place_id, max_images=10, db=db)
-            cached_images = get_cached_images(db, place_id, max_images=10)
+            all_images, all_image_urls, photo_names = get_place_images_with_metadata(place_id, max_images=50, min_required=20, db=db)
+            cached_images = get_cached_images(db, place_id, max_images=50)
         
         # Check which images need categorization
         cached_categories, _ = get_cached_categories_and_tags(db, place_id, photo_names)
@@ -494,9 +497,11 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
                         print(f"[WARNING] Failed to download {pn[:30]}...: {str(e)}")
             
             if images_to_categorize:
+                cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
                 categorized_results = categorize_images(
                     images_to_categorize, db=db, place_id=place_id, 
-                    photo_names=photo_names_to_categorize
+                    photo_names=photo_names_to_categorize,
+                    cache_quota=cache_quota, max_bar=2
                 )
                 for j, pn in enumerate(photo_names_to_categorize):
                     if j < len(categorized_results):
@@ -504,14 +509,14 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
                         cached_categories[pn] = category
         
         # Build categorized list for selection
+        # Quota: 2 exterior, 8 food, 8 interior, 2 drink = 20 total
         categorized_images = [(b"", cached_categories.get(pn, "other")) for pn in photo_names]
-        selected_images, selected_indices = select_diverse_images(categorized_images, max_images=5, randomize=False)
+        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        selected_images, selected_indices = select_images_by_quota(categorized_images, quota=image_quota, max_bar=2, randomize=False)
         
-        # Deduplicate indices
-        seen = set()
-        unique_indices = [i for i in selected_indices if i not in seen and not seen.add(i)]
-        selected_indices = unique_indices[:5]
-        selected_photo_names = [photo_names[i] for i in selected_indices if i < len(photo_names)]
+        # Run AI analysis on all selected images
+        analysis_indices = selected_indices  # Analyze ALL selected images
+        selected_photo_names = [photo_names[i] for i in analysis_indices if i < len(photo_names)]
         
         # Check for cached AI analysis
         analysis = get_cached_restaurant_analysis(db, place_id, selected_photo_names)
@@ -521,7 +526,7 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
             selected_images_bytes = []
             valid_photo_names = []
             
-            for idx in selected_indices:
+            for idx in analysis_indices:
                 if idx < len(all_image_urls):
                     try:
                         response = http_requests.get(all_image_urls[idx], timeout=10)
@@ -612,9 +617,11 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
         print(f"[DEBUG] Place ID: {place_id}")
         
         # Check for complete cached data first - this allows instant responses
+        # Quota: 2 exterior, 8 food, 8 interior, 2 drink = 20 total
         step_start = time.time()
         from app.services.database_service import get_complete_cached_restaurant_data
-        cached_data = get_complete_cached_restaurant_data(db, place_id, max_images=10, max_selected=5)
+        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        cached_data = get_complete_cached_restaurant_data(db, place_id, max_images=50, max_selected=20, quota=image_quota, max_bar=2)
         print(f"[PERF] check_complete_cache took {time.time() - step_start:.3f}s")
         
         if cached_data:
@@ -655,7 +662,7 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
         # Check if we have cached images
         step_start = time.time()
         from app.services.database_service import get_cached_images, get_cached_categories_and_tags
-        cached_images = get_cached_images(db, place_id, max_images=10)
+        cached_images = get_cached_images(db, place_id, max_images=50)
         print(f"[PERF] get_cached_images took {time.time() - step_start:.3f}s")
         print(f"[DEBUG] Found {len(cached_images) if cached_images else 0} cached images")
         
@@ -663,7 +670,7 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
         photo_names = []
         categorized_images = []
         
-        if cached_images and len(cached_images) >= 5:
+        if cached_images and len(cached_images) >= 20:
             print(f"[DEBUG] Using {len(cached_images)} cached images from database")
             all_image_urls = [img.gcs_url for img in cached_images]
             photo_names = [img.photo_name for img in cached_images]
@@ -676,7 +683,7 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
             images_with_categories = sum(1 for pn in photo_names if pn in cached_categories and cached_categories[pn])
             print(f"[DEBUG] Images with valid categories: {images_with_categories}")
             
-            if images_with_categories >= 5:
+            if images_with_categories >= 20:
                 # All categories are cached - use them directly (FAST PATH)
                 print(f"[DEBUG] Using cached categories (fast path)")
                 categorized_images = [(b"", cached_categories.get(pn, "other")) for pn in photo_names]
@@ -699,20 +706,23 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
                 
                 # Categorize images - this will use cached categories where available
                 # and only call AI for images without categories
-                categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names)
+                cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+                categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names, cache_quota=cache_quota, max_bar=2)
                 print(f"[DEBUG] Categorization complete")
         else:
-            print(f"[DEBUG] No cached images, fetching from Places API...")
-            # No cache - fetch from API
-            all_images, all_image_urls, photo_names = get_place_images_with_metadata(place_id, max_images=10, db=db)
+            print(f"[DEBUG] Not enough cached images ({len(cached_images) if cached_images else 0} < 20), fetching from Places API...")
+            # Not enough cache - fetch from API (will combine with existing cached)
+            all_images, all_image_urls, photo_names = get_place_images_with_metadata(place_id, max_images=50, min_required=20, db=db)
+            
+            # Refresh cached_images after potentially adding new ones
+            cached_images = get_cached_images(db, place_id, max_images=50)
             
             if all_images:
                 # Categorize and cache
-                categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names)
+                cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+                categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names, cache_quota=cache_quota, max_bar=2)
             else:
-                # get_place_images_with_metadata returned empty bytes (images are cached)
-                # Need to download from GCS and categorize
-                cached_images = get_cached_images(db, place_id, max_images=10)
+                # get_place_images_with_metadata returned empty bytes (images are already cached)
                 if cached_images:
                     all_image_urls = [img.gcs_url for img in cached_images]
                     photo_names = [img.photo_name for img in cached_images]
@@ -721,10 +731,14 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
                     cached_categories, _ = get_cached_categories_and_tags(db, place_id, photo_names)
                     images_with_categories = sum(1 for pn in photo_names if pn in cached_categories and cached_categories[pn])
                     
-                    if images_with_categories >= 5:
+                    # Only need 20 images with categories (not ALL images)
+                    if images_with_categories >= 20:
+                        # Enough categories are cached - use them directly (FAST PATH)
+                        print(f"[DEBUG] Using cached categories for {images_with_categories} images (fast path)")
                         categorized_images = [(b"", cached_categories.get(pn, "other")) for pn in photo_names]
                     else:
-                        # Download and categorize
+                        # Download and categorize only what we need
+                        print(f"[DEBUG] Only {images_with_categories} images have categories, need to categorize more...")
                         all_images = []
                         for img in cached_images:
                             try:
@@ -733,27 +747,33 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
                                 all_images.append(response.content)
                             except Exception as e:
                                 all_images.append(b"")
-                        categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names)
+                        cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+                        categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names, cache_quota=cache_quota, max_bar=2)
         
-        # Select diverse images based on categories
-        selected_images, selected_indices = select_diverse_images(categorized_images, max_images=5, randomize=False)
+        # Select images based on quota: 2 exterior, 8 food, 8 interior, 2 drink = 20 total
+        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        selected_images, selected_indices = select_images_by_quota(categorized_images, quota=image_quota, max_bar=2, randomize=False)
         
         # Get photo_names for selected images
         selected_photo_names = [photo_names[i] for i in selected_indices if i < len(photo_names)]
-        print(f"[DEBUG] Selected {len(selected_indices)} images with indices: {selected_indices}")
+        print(f"[DEBUG] Selected {len(selected_indices)} images for display")
+        
+        # Run AI analysis on all selected images
+        analysis_indices = selected_indices  # Analyze ALL selected images
+        analysis_photo_names = [photo_names[i] for i in analysis_indices if i < len(photo_names)]
         
         # Check for cached AI analysis
         from app.services.database_service import get_cached_restaurant_analysis
-        analysis = get_cached_restaurant_analysis(db, place_id, selected_photo_names)
+        analysis = get_cached_restaurant_analysis(db, place_id, analysis_photo_names)
         
         if not analysis:
             print(f"[DEBUG] No cached AI analysis, downloading selected images for analysis...")
-            # Need to run AI analysis - download only selected images from GCS
+            # Need to run AI analysis - download all 20 selected images for analysis
             selected_images_bytes = []
             valid_photo_names = []
             download_errors = []
             
-            for idx in selected_indices:
+            for idx in analysis_indices:
                 if idx < len(all_image_urls) and idx < len(photo_names):
                     try:
                         response = http_requests.get(all_image_urls[idx], timeout=10)
@@ -786,18 +806,48 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
             print(f"[DEBUG] Using cached AI analysis")
         
         # Build image metadata with URLs and categories
+        # Use photo_names to match URLs to avoid index mismatches
         image_metadata = []
         seen_urls = set()  # Deduplicate images
+        seen_photo_names = set()  # Also dedupe by photo_name
+        
+        # Build a mapping from photo_name to URL for reliable lookup
+        photo_name_to_url = {}
+        if cached_images:
+            for img in cached_images:
+                photo_name_to_url[img.photo_name] = img.gcs_url
+        else:
+            for i, pn in enumerate(photo_names):
+                if i < len(all_image_urls):
+                    photo_name_to_url[pn] = all_image_urls[i]
+        
+        print(f"[DEBUG] Building image metadata: {len(selected_indices)} selected, {len(photo_name_to_url)} URLs available")
+        
         for idx in selected_indices:
-            if idx < len(categorized_images) and idx < len(all_image_urls):
-                url = all_image_urls[idx]
-                if url not in seen_urls:
-                    _, category = categorized_images[idx]
-                    image_metadata.append(ImageMetadata(
-                        url=url,
-                        category=category
-                    ))
-                    seen_urls.add(url)
+            if idx < len(categorized_images) and idx < len(photo_names):
+                pn = photo_names[idx]
+                url = photo_name_to_url.get(pn)
+                _, category = categorized_images[idx]
+                
+                # Skip if no URL, already seen, or excluded category
+                if not url:
+                    print(f"[DEBUG] Skipping idx {idx}: no URL for photo_name")
+                    continue
+                if url in seen_urls or pn in seen_photo_names:
+                    print(f"[DEBUG] Skipping idx {idx}: duplicate URL or photo_name")
+                    continue
+                if category in ("menu", "other", "skipped"):
+                    print(f"[DEBUG] Skipping idx {idx}: excluded category '{category}'")
+                    continue
+                    
+                image_metadata.append(ImageMetadata(
+                    url=url,
+                    category=category
+                ))
+                seen_urls.add(url)
+                seen_photo_names.add(pn)
+        
+        print(f"[DEBUG] Final image_metadata count: {len(image_metadata)}")
         
         # Generate embedding for the restaurant (async, don't fail if it errors)
         try:
