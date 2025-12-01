@@ -184,7 +184,7 @@ def get_place_details(place_id: str) -> Dict:
         raise PlacesServiceError(f"Failed to get place details: {str(e)}")
 
 
-def get_place_images(place_id: str, max_images: int = 10, db: Optional[Session] = None) -> List[bytes]:
+def get_place_images(place_id: str, max_images: int = 50, db: Optional[Session] = None) -> List[bytes]:
     """
     Fetch restaurant images from Google Places API, with optional caching.
     
@@ -673,7 +673,7 @@ def extract_place_id_from_url(url: str, db: Optional[Session] = None) -> str:
     )
 
 
-def get_place_images_with_urls(place_id: str, max_images: int = 10, db: Optional[Session] = None) -> Tuple[List[bytes], List[str]]:
+def get_place_images_with_urls(place_id: str, max_images: int = 50, db: Optional[Session] = None) -> Tuple[List[bytes], List[str]]:
     """
     Fetch restaurant images from Google Places API and return both image bytes and URLs, with optional caching.
     
@@ -784,14 +784,18 @@ def get_place_images_with_urls(place_id: str, max_images: int = 10, db: Optional
     return images, image_urls
 
 
-def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Optional[Session] = None) -> Tuple[List[bytes], List[str], List[str]]:
+def get_place_images_with_metadata(place_id: str, max_images: int = 50, min_required: int = 20, db: Optional[Session] = None) -> Tuple[List[bytes], List[str], List[str]]:
     """
     Fetch restaurant images from Google Places API and return image bytes, URLs, and photo_names.
     Similar to get_place_images_with_urls but also returns photo_names for tracking.
     
+    If cached images exist but are fewer than min_required, fetches additional images
+    from the API to meet the quota (only fetches images not already cached).
+    
     Args:
         place_id: Google Places place_id
-        max_images: Maximum number of images to fetch (default: 10)
+        max_images: Maximum number of images to fetch (default: 50)
+        min_required: Minimum number of images needed (default: 20)
         db: Optional database session for caching
         
     Returns:
@@ -800,6 +804,9 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
     Raises:
         PlacesServiceError: If images cannot be fetched
     """
+    cached_images = []
+    cached_photo_names = set()
+    
     # Check cache first if db session is provided
     if db:
         try:
@@ -808,20 +815,22 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
             
             if cached_images:
                 print(f"[DEBUG] Found {len(cached_images)} cached images in database")
-                # Return cached URLs and photo_names directly - NO GCS downloads, NO API calls
-                # The caller should check if they need image bytes (for categorization/AI)
-                # If categories and AI tags are already cached, no bytes needed!
-                image_urls = [img.gcs_url for img in cached_images]
-                photo_names = [img.photo_name for img in cached_images]
-                # Return empty bytes - caller will only download if needed for processing
-                return [], image_urls, photo_names
+                cached_photo_names = {img.photo_name for img in cached_images}
+                
+                # If we have enough cached images, return them without API call
+                if len(cached_images) >= min_required:
+                    print(f"[DEBUG] Have enough cached images ({len(cached_images)} >= {min_required}), skipping API")
+                    image_urls = [img.gcs_url for img in cached_images]
+                    photo_names = [img.photo_name for img in cached_images]
+                    return [], image_urls, photo_names
+                else:
+                    print(f"[DEBUG] Need more images ({len(cached_images)} < {min_required}), will fetch from API")
         except Exception as e:
-            # If cache check fails, fall through to API fetch
             import traceback
             print(f"[ERROR] Cache check failed: {str(e)}")
             print(f"[ERROR] Traceback: {traceback.format_exc()}")
     
-    # No cache or cache miss - fetch from Google API
+    # Fetch from Google API (either no cache or need more images)
     if not GOOGLE_PLACES_API_KEY:
         raise PlacesServiceError("GOOGLE_PLACES_API_KEY not configured")
     
@@ -830,6 +839,12 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
     photos = place_details.get("photos", [])
     
     if not photos:
+        # If we have some cached images, return those even if not enough
+        if cached_images:
+            print(f"[DEBUG] No more photos available from API, returning {len(cached_images)} cached images")
+            image_urls = [img.gcs_url for img in cached_images]
+            photo_names_list = [img.photo_name for img in cached_images]
+            return [], image_urls, photo_names_list
         raise PlacesServiceError("No photos available for this restaurant")
     
     images = []
@@ -837,10 +852,24 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
     photo_names = []
     photo_metadata = []  # Store (image_bytes, photo_name) for caching
     
+    # Track how many new images we've fetched
+    new_images_fetched = 0
+    images_needed = max_images - len(cached_images)
+    
     for photo in photos[:max_images]:
         photo_name = photo.get("name")
         if not photo_name:
             continue
+        
+        # Skip if already cached
+        if photo_name in cached_photo_names:
+            print(f"[DEBUG] Skipping already cached image: {photo_name[:50]}...")
+            continue
+        
+        # Check if we have enough new images
+        if new_images_fetched >= images_needed:
+            print(f"[DEBUG] Fetched enough new images ({new_images_fetched}), stopping")
+            break
         
         # Fetch the actual image from Google Places API
         try:
@@ -858,32 +887,41 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
             image_urls.append(None)
             photo_names.append(photo_name)
             photo_metadata.append((image_bytes, photo_name))
+            new_images_fetched += 1
         except requests.RequestException as e:
             # Continue with other images if one fails
             print(f"[WARNING] Failed to fetch image from Places API: {str(e)}")
             continue
     
+    print(f"[DEBUG] Fetched {new_images_fetched} new images from API")
+    
+    # If no new images and we have cached, return cached
+    if not images and cached_images:
+        print(f"[DEBUG] No new images fetched, returning {len(cached_images)} cached images")
+        image_urls = [img.gcs_url for img in cached_images]
+        photo_names_list = [img.photo_name for img in cached_images]
+        return [], image_urls, photo_names_list
+    
     if not images:
         raise PlacesServiceError("Failed to download any images")
     
-    # Cache the images to GCS if db session is provided
+    # Cache the NEW images to GCS if db session is provided
     # This is REQUIRED for the URLs to work - we need GCS URLs, not proxy URLs
     if db and photo_metadata:
         try:
             from app.services.database_service import cache_images
             restaurant_name = get_restaurant_name(place_id)
-            print(f"[DEBUG] Caching {len(photo_metadata)} images to GCS for {place_id}")
+            print(f"[DEBUG] Caching {len(photo_metadata)} NEW images to GCS for {place_id}")
             # Note: category will be set later by vision_service
             cached_result = cache_images(db, place_id, restaurant_name, [
                 (img_bytes, photo_name, None) for img_bytes, photo_name in photo_metadata
             ])
-            print(f"[DEBUG] Successfully cached {len(cached_result)} images to GCS")
+            print(f"[DEBUG] Successfully cached {len(cached_result)} new images to GCS")
             
-            # Get GCS URLs directly from the cached_result (RestaurantImage objects)
-            # Build a mapping from photo_name to GCS URL
+            # Build mapping from photo_name to GCS URL for new images
             photo_to_gcs_url = {img.photo_name: img.gcs_url for img in cached_result}
             
-            # Update image_urls with GCS URLs in the same order as photo_names
+            # Update image_urls with GCS URLs for new images
             new_image_urls = []
             new_images = []
             new_photo_names = []
@@ -897,10 +935,15 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
                 else:
                     print(f"[WARNING] No GCS URL for photo {pn[:50]}...")
             
-            images = new_images
-            image_urls = new_image_urls
-            photo_names = new_photo_names
-            print(f"[DEBUG] ✅ Updated {len(image_urls)} image URLs to use GCS URLs")
+            # Combine with existing cached images
+            # Put existing cached images first, then new ones
+            all_image_urls = [img.gcs_url for img in cached_images] + new_image_urls
+            all_photo_names = [img.photo_name for img in cached_images] + new_photo_names
+            all_images = []  # Return empty bytes - caller will download if needed
+            
+            print(f"[DEBUG] ✅ Total images: {len(cached_images)} cached + {len(new_image_urls)} new = {len(all_image_urls)}")
+            
+            return all_images, all_image_urls, all_photo_names
             
         except Exception as e:
             # Log error - this is a critical failure, images won't work without GCS URLs
@@ -908,12 +951,12 @@ def get_place_images_with_metadata(place_id: str, max_images: int = 10, db: Opti
             print(f"[ERROR] Failed to cache images to GCS: {str(e)}")
             print(f"[ERROR] Traceback: {traceback.format_exc()}")
             raise PlacesServiceError(f"Failed to upload images to GCS: {str(e)}")
+    elif db and cached_images and not photo_metadata:
+        # No new images to cache, just return existing cached
+        all_image_urls = [img.gcs_url for img in cached_images]
+        all_photo_names = [img.photo_name for img in cached_images]
+        return [], all_image_urls, all_photo_names
     else:
         # No database session - can't cache, so we can't get proper URLs
         raise PlacesServiceError("Database session required to cache images to GCS")
-    
-    if not images or not image_urls:
-        raise PlacesServiceError("Failed to cache any images to GCS")
-    
-    return images, image_urls, photo_names
 
