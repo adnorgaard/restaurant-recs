@@ -1,5 +1,6 @@
 import os
 from typing import List, Optional
+from datetime import datetime, timezone
 from openai import OpenAI
 from sqlalchemy.orm import Session
 from app.models.database import Restaurant, RestaurantImage
@@ -13,6 +14,9 @@ load_dotenv(dotenv_path=env_path)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EMBEDDING_MODEL = "text-embedding-3-small"
+
+# Import version configuration
+from app.config.ai_versions import EMBEDDING_VERSION
 
 
 class EmbeddingServiceError(Exception):
@@ -125,10 +129,14 @@ def update_restaurant_embedding(db: Session, restaurant_id: int) -> Restaurant:
         # Generate embedding
         embedding = generate_restaurant_embedding(db, restaurant_id)
         
-        # Update restaurant
+        # Update restaurant with embedding and version tracking
         restaurant.embedding = embedding
+        restaurant.embedding_version = EMBEDDING_VERSION
+        restaurant.embedding_updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(restaurant)
+        
+        print(f"[EMBEDDING] ✅ Updated embedding for restaurant {restaurant_id} (version: {EMBEDDING_VERSION})")
         
         return restaurant
     except EmbeddingServiceError:
