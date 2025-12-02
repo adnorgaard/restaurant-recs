@@ -17,7 +17,7 @@ python scripts/bulk_process.py --db-all --dry-run
 # Force regenerate specific components
 python scripts/bulk_process.py --db-all --force --components description
 
-# Completely refresh a restaurant's images (delete + re-fetch from API)
+# Full refresh - delete everything and rebuild from scratch
 python scripts/bulk_process.py --place-ids ChIJxxx --refresh-images
 ```
 
@@ -102,7 +102,24 @@ python scripts/bulk_process.py --place-ids ChIJ123 ChIJ456 --mode force
 | Net New | `--mode net-new` | Only process completely missing data |
 | Refresh Stale | `--mode refresh-stale` | Only process outdated versions |
 
-## Image Refresh
+## Full Refresh
+
+A "full refresh" completely rebuilds a restaurant's data from scratch using the `--refresh-images` flag:
+
+- Deletes all existing images (database + GCS)
+- Clears descriptions and embeddings
+- Re-fetches all photos from the API
+- Re-runs all AI analysis (categorization, quality scoring, descriptions, embeddings)
+
+```bash
+# Full refresh for specific restaurants
+python scripts/bulk_process.py --place-ids ChIJxxx --refresh-images
+
+# Full refresh by name (create a CSV with name,location columns)
+python scripts/bulk_process.py --input my_restaurants.csv --refresh-images
+```
+
+### Image Refresh Details
 
 Use `--refresh-images` to completely refresh a restaurant's images:
 
