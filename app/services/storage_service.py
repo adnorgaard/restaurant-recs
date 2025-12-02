@@ -203,3 +203,50 @@ def delete_image_from_gcs(bucket_path: str) -> None:
     except Exception as e:
         raise StorageServiceError(f"Failed to delete image from GCS: {str(e)}")
 
+
+def stream_upload_to_gcs(
+    image_url: str,
+    place_id: str,
+    photo_name: str,
+    content_type: str = "image/jpeg",
+    timeout: int = 30
+) -> Tuple[str, str]:
+    """
+    Download image from URL and upload to GCS in a single operation.
+    
+    This is more efficient than separate download/upload as it:
+    - Uses a single function call (better for parallelization)
+    - Still buffers in memory (GCS requires content-length)
+    
+    Args:
+        image_url: URL to download image from
+        place_id: Google Places place_id (used for organizing in bucket)
+        photo_name: Unique identifier for the photo
+        content_type: MIME type of the image (default: image/jpeg)
+        timeout: Request timeout in seconds
+        
+    Returns:
+        Tuple of (public_url, bucket_path)
+        
+    Raises:
+        StorageServiceError: If download or upload fails
+    """
+    import requests
+    
+    if not GCS_BUCKET_NAME:
+        raise StorageServiceError("GCS_BUCKET_NAME environment variable is not set")
+    
+    try:
+        # Download image
+        response = requests.get(image_url, timeout=timeout)
+        response.raise_for_status()
+        image_bytes = response.content
+        
+        # Use existing upload function (handles deduplication)
+        return upload_image_to_gcs(image_bytes, place_id, photo_name, content_type)
+        
+    except requests.RequestException as e:
+        raise StorageServiceError(f"Failed to download image: {str(e)}")
+    except Exception as e:
+        raise StorageServiceError(f"Failed to stream upload: {str(e)}")
+

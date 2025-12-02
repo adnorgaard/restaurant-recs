@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models.database import Restaurant, RestaurantImage, PromptVersion
 from app.services.storage_service import (
     upload_image_to_gcs,
+    delete_image_from_gcs,
     StorageServiceError,
     get_storage_client,
     GCS_BUCKET_NAME,
@@ -213,6 +214,85 @@ def cache_images(
         raise DatabaseServiceError(f"Failed to cache images: {str(e)}")
 
 
+def delete_restaurant_images(
+    db: Session,
+    place_id: str,
+    delete_from_gcs: bool = True
+) -> Dict[str, int]:
+    """
+    Delete all images for a restaurant from database and optionally from GCS.
+    
+    This is used for completely refreshing a restaurant's images.
+    
+    Args:
+        db: Database session
+        place_id: Google Places place_id
+        delete_from_gcs: If True, also delete images from GCS bucket
+        
+    Returns:
+        Dict with counts: {"deleted_db": N, "deleted_gcs": N, "gcs_errors": N}
+        
+    Raises:
+        DatabaseServiceError: If operation fails
+    """
+    try:
+        restaurant = db.query(Restaurant).filter(Restaurant.place_id == place_id).first()
+        
+        if not restaurant:
+            return {"deleted_db": 0, "deleted_gcs": 0, "gcs_errors": 0}
+        
+        # Get all images for this restaurant
+        images = db.query(RestaurantImage).filter(
+            RestaurantImage.restaurant_id == restaurant.id
+        ).all()
+        
+        deleted_db = 0
+        deleted_gcs = 0
+        gcs_errors = 0
+        
+        for image in images:
+            # Delete from GCS if requested
+            if delete_from_gcs and image.gcs_bucket_path:
+                try:
+                    delete_image_from_gcs(image.gcs_bucket_path)
+                    deleted_gcs += 1
+                except StorageServiceError as e:
+                    print(f"[WARNING] Failed to delete from GCS: {image.gcs_bucket_path}: {e}")
+                    gcs_errors += 1
+                except Exception as e:
+                    print(f"[WARNING] Unexpected error deleting from GCS: {e}")
+                    gcs_errors += 1
+            
+            # Delete from database
+            db.delete(image)
+            deleted_db += 1
+        
+        # Also clear the restaurant's description and embedding since they're based on images
+        restaurant.description = None
+        restaurant.description_version = None
+        restaurant.description_updated_at = None
+        restaurant.embedding = None
+        restaurant.embedding_version = None
+        restaurant.embedding_updated_at = None
+        
+        db.commit()
+        
+        print(f"[DB] 🗑️ Deleted {deleted_db} images for {place_id} (GCS: {deleted_gcs}, errors: {gcs_errors})")
+        
+        return {
+            "deleted_db": deleted_db,
+            "deleted_gcs": deleted_gcs,
+            "gcs_errors": gcs_errors
+        }
+        
+    except Exception as e:
+        db.rollback()
+        import traceback
+        print(f"[ERROR] Failed to delete restaurant images: {str(e)}")
+        print(f"[ERROR] Traceback: {traceback.format_exc()}")
+        raise DatabaseServiceError(f"Failed to delete restaurant images: {str(e)}")
+
+
 def backfill_images_from_gcs(
     db: Session,
     place_id: str,
@@ -311,10 +391,11 @@ def update_image_tags(
     category: Optional[str] = None,
     ai_tags: Optional[List[str]] = None,
     category_version: Optional[str] = None,
-    tags_version: Optional[str] = None
+    tags_version: Optional[str] = None,
+    is_displayed: Optional[bool] = None
 ) -> RestaurantImage:
     """
-    Update category and/or AI tags for a specific image.
+    Update category, AI tags, and/or display status for a specific image.
     
     Args:
         db: Database session
@@ -323,6 +404,7 @@ def update_image_tags(
         ai_tags: Optional new AI tags list
         category_version: Version of the categorization logic used
         tags_version: Version of the tagging logic used
+        is_displayed: Optional flag to mark if image should be shown on website
         
     Returns:
         Updated RestaurantImage instance
@@ -352,6 +434,10 @@ def update_image_tags(
                 image.tags_version = tags_version
                 image.tags_updated_at = now
         
+        # Update display status if provided
+        if is_displayed is not None:
+            image.is_displayed = is_displayed
+        
         db.commit()
         db.refresh(image)
         
@@ -376,6 +462,83 @@ def get_image_by_id(db: Session, image_id: int) -> Optional[RestaurantImage]:
         RestaurantImage instance or None if not found
     """
     return db.query(RestaurantImage).filter(RestaurantImage.id == image_id).first()
+
+
+def get_displayed_images(
+    db: Session,
+    place_id: str,
+) -> List[RestaurantImage]:
+    """
+    Get only images that are marked for display on the website.
+    
+    Args:
+        db: Database session
+        place_id: Google Places place_id
+        
+    Returns:
+        List of RestaurantImage instances where is_displayed=True
+    """
+    restaurant = db.query(Restaurant).filter(Restaurant.place_id == place_id).first()
+    
+    if not restaurant:
+        return []
+    
+    return db.query(RestaurantImage).filter(
+        RestaurantImage.restaurant_id == restaurant.id,
+        RestaurantImage.is_displayed == True
+    ).order_by(RestaurantImage.created_at.desc()).all()
+
+
+def mark_images_as_displayed(
+    db: Session,
+    place_id: str,
+    image_ids: List[int],
+    reset_others: bool = True
+) -> int:
+    """
+    Mark specific images as displayed (for showing on website).
+    Optionally reset all other images for this restaurant to not displayed.
+    
+    Args:
+        db: Database session
+        place_id: Google Places place_id
+        image_ids: List of image IDs to mark as displayed
+        reset_others: If True, set is_displayed=False for all other images of this restaurant
+        
+    Returns:
+        Number of images marked as displayed
+        
+    Raises:
+        DatabaseServiceError: If operation fails
+    """
+    try:
+        restaurant = db.query(Restaurant).filter(Restaurant.place_id == place_id).first()
+        
+        if not restaurant:
+            raise DatabaseServiceError(f"Restaurant with place_id {place_id} not found")
+        
+        # Reset all images for this restaurant if requested
+        if reset_others:
+            db.query(RestaurantImage).filter(
+                RestaurantImage.restaurant_id == restaurant.id
+            ).update({"is_displayed": False})
+        
+        # Mark specified images as displayed
+        updated = db.query(RestaurantImage).filter(
+            RestaurantImage.id.in_(image_ids),
+            RestaurantImage.restaurant_id == restaurant.id
+        ).update({"is_displayed": True}, synchronize_session=False)
+        
+        db.commit()
+        
+        print(f"[DB] ✅ Marked {updated} images as displayed for {place_id}")
+        return updated
+        
+    except DatabaseServiceError:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise DatabaseServiceError(f"Failed to mark images as displayed: {str(e)}")
 
 
 def store_ai_tags_for_images(
@@ -629,13 +792,17 @@ def get_complete_cached_restaurant_data(
     max_images: int = 50,
     max_selected: int = 20,
     quota: Optional[Dict[str, int]] = None,
-    max_bar: int = 2
+    max_bar: int = 2,
+    update_displayed: bool = True
 ) -> Optional[Dict]:
     """
     Get complete cached restaurant data including name, images, categories, and AI analysis.
     This allows for instant responses when all data is fully cached.
     
     Returns None if ANY required data is missing, triggering the normal flow to fill the cache.
+    
+    When data is successfully returned, marks selected images as is_displayed=True
+    so the website can filter to only show those images.
     
     Rules:
     - Bar counts as interior (max 2 bar images allowed by default)
@@ -648,8 +815,9 @@ def get_complete_cached_restaurant_data(
         max_images: Maximum number of images to retrieve from cache
         max_selected: Maximum number of images to select for display
         quota: Dict mapping category to desired count.
-               Default: {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+               Default: {"food": 10, "interior": 10}
         max_bar: Maximum bar images (counts toward interior quota)
+        update_displayed: If True, update is_displayed flag for selected images
         
     Returns:
         Dictionary with 'restaurant_name', 'images', 'image_urls', 'photo_names', 
@@ -657,7 +825,7 @@ def get_complete_cached_restaurant_data(
     """
     # Default quota: 2 exterior, 8 interior, 8 food, 2 drink = 20 total
     if quota is None:
-        quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        quota = {"food": 10, "interior": 10}
     
     total_quota = sum(quota.values())
     
@@ -670,7 +838,44 @@ def get_complete_cached_restaurant_data(
         print(f"[CACHE] ❌ No restaurant found for place_id: {place_id}")
         return None
     
-    # Get cached images
+    # First check if we have already-displayed images (fast path for subsequent requests)
+    displayed_images = db.query(RestaurantImage).filter(
+        RestaurantImage.restaurant_id == restaurant.id,
+        RestaurantImage.is_displayed == True
+    ).all()
+    
+    # If we have displayed images with AI tags, use them directly
+    if displayed_images and len(displayed_images) >= 5:
+        images_with_ai_tags = [img for img in displayed_images if img.ai_tags and len(img.ai_tags) > 0]
+        if len(images_with_ai_tags) == len(displayed_images):
+            photo_names_with_tags = [img.photo_name for img in images_with_ai_tags]
+            analysis = get_cached_restaurant_analysis(db, place_id, photo_names_with_tags)
+            if analysis:
+                print(f"[CACHE] ✅ Using pre-selected displayed images for {place_id}")
+                seen_urls = set()
+                image_metadata = []
+                for img in displayed_images:
+                    if img.gcs_url not in seen_urls:
+                        image_metadata.append({
+                            'id': img.id,
+                            'photo_name': img.photo_name,
+                            'gcs_url': img.gcs_url,
+                            'category': img.category.lower() if img.category else 'other',
+                            'ai_tags': img.ai_tags,
+                            'is_displayed': img.is_displayed
+                        })
+                        seen_urls.add(img.gcs_url)
+                
+                return {
+                    'restaurant_name': restaurant.name,
+                    'images': image_metadata,
+                    'image_urls': [img['gcs_url'] for img in image_metadata],
+                    'photo_names': [img['photo_name'] for img in image_metadata],
+                    'categories': {img['photo_name']: img['category'] for img in image_metadata},
+                    'analysis': analysis
+                }
+    
+    # Get all cached images
     cached_images = get_cached_images(db, place_id, max_images)
     
     if not cached_images:
@@ -792,6 +997,11 @@ def get_complete_cached_restaurant_data(
         print(f"[CACHE] ❌ Failed to construct analysis from cached AI tags")
         return None
     
+    # Mark selected images as displayed (for future fast lookups)
+    if update_displayed:
+        selected_ids = [img.id for img in final_images]
+        mark_images_as_displayed(db, place_id, selected_ids, reset_others=True)
+    
     print(f"[CACHE] ✅ Complete cached data available for {place_id} ({restaurant.name})")
     
     # Build image metadata - ensure no duplicates
@@ -804,7 +1014,8 @@ def get_complete_cached_restaurant_data(
                 'photo_name': img.photo_name,
                 'gcs_url': img.gcs_url,
                 'category': img.category.lower(),
-                'ai_tags': img.ai_tags
+                'ai_tags': img.ai_tags,
+                'is_displayed': True  # These are the displayed images
             })
             seen_urls.add(img.gcs_url)
     

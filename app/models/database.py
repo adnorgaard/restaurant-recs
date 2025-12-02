@@ -31,7 +31,8 @@ class Restaurant(Base):
     __tablename__ = "restaurants"
 
     id = Column(Integer, primary_key=True, index=True)
-    place_id = Column(String, unique=True, index=True, nullable=False)
+    place_id = Column(String, unique=True, index=True, nullable=False)  # Google Places ID
+    serpapi_data_id = Column(String, nullable=True, index=True)  # SerpApi data_id for Google Maps
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)  # AI-generated description of the restaurant
     embedding = Column(JSON, nullable=True)  # Vector embedding for semantic search (stored as JSON array)
@@ -63,6 +64,7 @@ class RestaurantImage(Base):
     gcs_bucket_path = Column(String, nullable=False)  # Path in bucket for reference
     category = Column(String, nullable=True)  # e.g., "interior", "exterior", "food", "menu", "bar", "other"
     ai_tags = Column(JSON, nullable=True)  # AI-generated tags as JSON array
+    is_displayed = Column(Boolean, default=False, nullable=False)  # Whether this image is shown on the website
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
