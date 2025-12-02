@@ -21,6 +21,18 @@ from app.services.photo_service import (
     log_cost_summary,
 )
 
+# Quality service exports
+from app.services.quality_service import (
+    QualityScores,
+    QualityServiceError,
+    score_image_quality,
+    score_image_quality_from_url,
+    score_images_batch,
+    score_and_filter_images_for_restaurant,
+    apply_quality_filter_and_select,
+    get_displayable_images,
+)
+
 __all__ = [
     "ProcessingMode",
     "Component",
@@ -37,5 +49,13 @@ __all__ = [
     "get_cost_tracker",
     "reset_cost_tracker",
     "log_cost_summary",
+    "QualityScores",
+    "QualityServiceError",
+    "score_image_quality",
+    "score_image_quality_from_url",
+    "score_images_batch",
+    "score_and_filter_images_for_restaurant",
+    "apply_quality_filter_and_select",
+    "get_displayable_images",
 ]
 

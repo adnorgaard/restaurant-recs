@@ -1077,7 +1077,7 @@ def get_stale_images(
     
     Args:
         db: Database session
-        component: "category" or "tags"
+        component: "category", "tags", or "quality"
         current_version: The current active version to compare against
         
     Returns:
@@ -1088,16 +1088,21 @@ def get_stale_images(
     """
     if component == "category":
         return db.query(RestaurantImage).filter(
-            (RestaurantImage.category_version == None) | 
+            (RestaurantImage.category_version == None) |   # noqa: E711
             (RestaurantImage.category_version != current_version)
         ).all()
     elif component == "tags":
         return db.query(RestaurantImage).filter(
-            (RestaurantImage.tags_version == None) | 
+            (RestaurantImage.tags_version == None) |   # noqa: E711
             (RestaurantImage.tags_version != current_version)
         ).all()
+    elif component == "quality":
+        return db.query(RestaurantImage).filter(
+            (RestaurantImage.quality_version == None) |   # noqa: E711
+            (RestaurantImage.quality_version != current_version)
+        ).all()
     else:
-        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'category' or 'tags'")
+        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'category', 'tags', or 'quality'")
 
 
 def get_restaurants_missing_data(
@@ -1131,17 +1136,19 @@ def get_images_missing_data(
     
     Args:
         db: Database session
-        component: "category" or "tags"
+        component: "category", "tags", or "quality"
         
     Returns:
         List of RestaurantImage instances missing the specified data
     """
     if component == "category":
-        return db.query(RestaurantImage).filter(RestaurantImage.category == None).all()
+        return db.query(RestaurantImage).filter(RestaurantImage.category == None).all()  # noqa: E711
     elif component == "tags":
-        return db.query(RestaurantImage).filter(RestaurantImage.ai_tags == None).all()
+        return db.query(RestaurantImage).filter(RestaurantImage.ai_tags == None).all()  # noqa: E711
+    elif component == "quality":
+        return db.query(RestaurantImage).filter(RestaurantImage.quality_version == None).all()  # noqa: E711
     else:
-        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'category' or 'tags'")
+        raise DatabaseServiceError(f"Invalid component: {component}. Must be 'category', 'tags', or 'quality'")
 
 
 def get_version_stats(db: Session) -> Dict:

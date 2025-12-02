@@ -82,6 +82,7 @@ class Component(Enum):
     TAGS = "tags"
     DESCRIPTION = "description"
     EMBEDDING = "embedding"
+    QUALITY = "quality"  # Image quality scoring (people, lighting, blur)
     ALL = "all"
 
 
@@ -281,10 +282,25 @@ def get_restaurants_from_db(
         return [RestaurantInput(place_id=r.place_id, name=r.name) for r in restaurants]
     
     if Component.ALL in components:
-        components = [Component.CATEGORY, Component.TAGS, Component.DESCRIPTION, Component.EMBEDDING]
+        components = [Component.CATEGORY, Component.TAGS, Component.DESCRIPTION, Component.EMBEDDING, Component.QUALITY]
     
     for component in components:
-        if component == Component.DESCRIPTION:
+        if component == Component.QUALITY:
+            current_version = get_active_version(db, "quality")
+            
+            if mode == ProcessingMode.AUTO:
+                missing_images = get_images_missing_data(db, "quality")
+                stale_images = get_stale_images(db, "quality", current_version)
+                restaurant_ids.update(img.restaurant_id for img in missing_images)
+                restaurant_ids.update(img.restaurant_id for img in stale_images)
+            elif mode == ProcessingMode.NET_NEW:
+                missing_images = get_images_missing_data(db, "quality")
+                restaurant_ids.update(img.restaurant_id for img in missing_images)
+            else:  # REFRESH_STALE
+                stale_images = get_stale_images(db, "quality", current_version)
+                restaurant_ids.update(img.restaurant_id for img in stale_images)
+                
+        elif component == Component.DESCRIPTION:
             current_version = get_active_version(db, "description")
             
             if mode == ProcessingMode.AUTO:
@@ -427,6 +443,18 @@ def should_process_image_component(
         else:  # REFRESH_STALE
             return is_stale
     
+    elif component == Component.QUALITY:
+        is_missing = image.quality_version is None
+        current_version = get_active_version(db, "quality")
+        is_stale = image.quality_version != current_version
+        
+        if mode == ProcessingMode.AUTO:
+            return is_missing or is_stale
+        elif mode == ProcessingMode.NET_NEW:
+            return is_missing
+        else:  # REFRESH_STALE
+            return is_stale
+    
     return False
 
 
@@ -465,7 +493,7 @@ def process_single_restaurant(
     components_skipped = []
     
     if Component.ALL in components:
-        components = [Component.CATEGORY, Component.TAGS, Component.DESCRIPTION, Component.EMBEDDING]
+        components = [Component.CATEGORY, Component.TAGS, Component.DESCRIPTION, Component.EMBEDDING, Component.QUALITY]
     
     # Initialize photo service with provider override
     photo_service = PhotoService(photo_provider_override=photo_provider)
@@ -516,7 +544,7 @@ def process_single_restaurant(
             
             # Check images
             cached_images = get_cached_images(db, place_id, max_images=50)
-            for comp in [Component.CATEGORY, Component.TAGS]:
+            for comp in [Component.CATEGORY, Component.TAGS, Component.QUALITY]:
                 if comp in components:
                     needs_processing = any(
                         should_process_image_component(db, img, comp, mode)
@@ -739,6 +767,31 @@ def process_single_restaurant(
                 components_processed.append("embedding")
             else:
                 components_skipped.append("embedding")
+        
+        # Step 7: Quality scoring and display selection
+        if Component.QUALITY in components:
+            from app.services.quality_service import apply_quality_filter_and_select
+            
+            # Check if any images need quality scoring
+            images_need_scoring = any(
+                should_process_image_component(db, img, Component.QUALITY, mode)
+                for img in cached_images
+            )
+            
+            if images_need_scoring:
+                print(f"[QUALITY] Running quality scoring for {restaurant_name}...")
+                
+                # This scores images, filters by quality, selects by quota, and sets is_displayed
+                selected_images = apply_quality_filter_and_select(
+                    db, place_id,
+                    quota={"food": 8, "interior": 8, "exterior": 2, "drink": 2},
+                    max_workers=5,
+                )
+                
+                print(f"[QUALITY] Selected {len(selected_images)} images for display")
+                components_processed.append("quality")
+            else:
+                components_skipped.append("quality")
         
         return ProcessingResult(
             place_id=place_id,

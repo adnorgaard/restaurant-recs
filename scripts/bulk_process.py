@@ -62,6 +62,9 @@ Examples:
   # Force regenerate descriptions only
   python scripts/bulk_process.py --db-all --force --components description
   
+  # Run quality scoring only (people, lighting, blur detection)
+  python scripts/bulk_process.py --db-all --components quality
+  
   # Preview what would be processed
   python scripts/bulk_process.py --db-all --dry-run
   
@@ -113,7 +116,7 @@ Examples:
         "--components", "-c",
         type=str,
         default="all",
-        help="Comma-separated list of components: category,tags,description,embedding,all (default: all)"
+        help="Comma-separated list of components: category,tags,description,embedding,quality,all (default: all)"
     )
     
     # Concurrency settings
@@ -193,6 +196,8 @@ def parse_components(components_str: str) -> list[Component]:
             components.append(Component.DESCRIPTION)
         elif comp == "embedding":
             components.append(Component.EMBEDDING)
+        elif comp == "quality":
+            components.append(Component.QUALITY)
         else:
             raise ValueError(f"Unknown component: {comp}")
     return components if components else [Component.ALL]
