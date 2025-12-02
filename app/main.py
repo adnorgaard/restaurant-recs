@@ -45,6 +45,8 @@ from app.services.database_service import (
     get_image_by_id,
     DatabaseServiceError,
     backfill_images_from_gcs,
+    mark_images_as_displayed,
+    get_displayed_images,
 )
 from app.services.auth_service import (
     create_user, authenticate_user, get_user_by_email,
@@ -442,7 +444,7 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
             get_complete_cached_restaurant_data, get_cached_images, 
             get_cached_categories_and_tags, get_cached_restaurant_analysis
         )
-        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        image_quota = {"food": 10, "interior": 10}
         cached_data = get_complete_cached_restaurant_data(db, place_id, max_images=50, max_selected=20, quota=image_quota, max_bar=2)
         
         if cached_data:
@@ -497,7 +499,7 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
                         print(f"[WARNING] Failed to download {pn[:30]}...: {str(e)}")
             
             if images_to_categorize:
-                cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+                cache_quota = {"food": 10, "interior": 10}
                 categorized_results = categorize_images(
                     images_to_categorize, db=db, place_id=place_id, 
                     photo_names=photo_names_to_categorize,
@@ -511,12 +513,22 @@ async def classify_restaurant(request: ClassifyRequest, db: Session = Depends(ge
         # Build categorized list for selection
         # Quota: 2 exterior, 8 food, 8 interior, 2 drink = 20 total
         categorized_images = [(b"", cached_categories.get(pn, "other")) for pn in photo_names]
-        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        image_quota = {"food": 10, "interior": 10}
         selected_images, selected_indices = select_images_by_quota(categorized_images, quota=image_quota, max_bar=2, randomize=False)
         
         # Run AI analysis on all selected images
         analysis_indices = selected_indices  # Analyze ALL selected images
         selected_photo_names = [photo_names[i] for i in analysis_indices if i < len(photo_names)]
+        
+        # Mark selected images as displayed in the database
+        if cached_images:
+            photo_name_to_id = {img.photo_name: img.id for img in cached_images}
+            selected_image_ids = [
+                photo_name_to_id[pn] for pn in selected_photo_names 
+                if pn in photo_name_to_id
+            ]
+            if selected_image_ids:
+                mark_images_as_displayed(db, place_id, selected_image_ids, reset_others=True)
         
         # Check for cached AI analysis
         analysis = get_cached_restaurant_analysis(db, place_id, selected_photo_names)
@@ -620,7 +632,7 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
         # Quota: 2 exterior, 8 food, 8 interior, 2 drink = 20 total
         step_start = time.time()
         from app.services.database_service import get_complete_cached_restaurant_data
-        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        image_quota = {"food": 10, "interior": 10}
         cached_data = get_complete_cached_restaurant_data(db, place_id, max_images=50, max_selected=20, quota=image_quota, max_bar=2)
         print(f"[PERF] check_complete_cache took {time.time() - step_start:.3f}s")
         
@@ -706,7 +718,7 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
                 
                 # Categorize images - this will use cached categories where available
                 # and only call AI for images without categories
-                cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+                cache_quota = {"food": 10, "interior": 10}
                 categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names, cache_quota=cache_quota, max_bar=2)
                 print(f"[DEBUG] Categorization complete")
         else:
@@ -719,7 +731,7 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
             
             if all_images:
                 # Categorize and cache
-                cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+                cache_quota = {"food": 10, "interior": 10}
                 categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names, cache_quota=cache_quota, max_bar=2)
             else:
                 # get_place_images_with_metadata returned empty bytes (images are already cached)
@@ -747,16 +759,27 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
                                 all_images.append(response.content)
                             except Exception as e:
                                 all_images.append(b"")
-                        cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+                        cache_quota = {"food": 10, "interior": 10}
                         categorized_images = categorize_images(all_images, db=db, place_id=place_id, photo_names=photo_names, cache_quota=cache_quota, max_bar=2)
         
         # Select images based on quota: 2 exterior, 8 food, 8 interior, 2 drink = 20 total
-        image_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        image_quota = {"food": 10, "interior": 10}
         selected_images, selected_indices = select_images_by_quota(categorized_images, quota=image_quota, max_bar=2, randomize=False)
         
         # Get photo_names for selected images
         selected_photo_names = [photo_names[i] for i in selected_indices if i < len(photo_names)]
         print(f"[DEBUG] Selected {len(selected_indices)} images for display")
+        
+        # Mark selected images as displayed in the database
+        if cached_images:
+            photo_name_to_id = {img.photo_name: img.id for img in cached_images}
+            selected_image_ids = [
+                photo_name_to_id[pn] for pn in selected_photo_names 
+                if pn in photo_name_to_id
+            ]
+            if selected_image_ids:
+                mark_images_as_displayed(db, place_id, selected_image_ids, reset_others=True)
+                print(f"[DEBUG] Marked {len(selected_image_ids)} images as is_displayed=True")
         
         # Run AI analysis on all selected images
         analysis_indices = selected_indices  # Analyze ALL selected images

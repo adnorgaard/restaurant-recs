@@ -93,44 +93,35 @@ def categorize_images(
     max_bar: int = 2
 ) -> List[Tuple[bytes, str]]:
     """
-    Categorize a list of images. Uses cached categories when available.
-    Only calls AI for images that have actual bytes AND don't have cached categories.
+    Categorize ALL images in the list. Uses cached categories when available.
+    Calls AI for every image that has bytes AND doesn't have a cached category.
     
-    Implements "stop when quota met" optimization - stops categorizing once we have
-    enough images in each valid category to meet the cache quota.
+    All images are categorized so we know which category each belongs to.
+    This is necessary to determine which images meet the display quota.
     
     Args:
         images: List of image bytes (can be empty bytes b"" for cached images)
         db: Optional database session to store categories
         place_id: Optional place_id for storing categories in database
         photo_names: Optional list of photo_names corresponding to images (must match length)
-        cache_quota: Target quota per category. Default: {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
-        max_bar: Maximum bar images (count toward interior quota)
+        cache_quota: Display quota per category (for logging only). Default: {"food": 10, "interior": 10}
+        max_bar: Maximum bar images that count toward interior quota
         
     Returns:
         List of tuples (image_bytes, category)
     """
     # Default cache quota: 2 exterior, 8 interior, 8 food, 2 drink = 20 total
     if cache_quota is None:
-        cache_quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        cache_quota = {"food": 10, "interior": 10}
     
-    # Valid categories we want to cache (excludes menu, other)
+    # Valid categories we track
     valid_categories = {"exterior", "interior", "food", "drink", "bar"}
     
-    # Track category counts for quota optimization
+    # Track category counts for logging
     category_counts = {cat: 0 for cat in cache_quota}
-    category_counts["bar"] = 0  # Track bar separately
-    
-    def is_quota_met() -> bool:
-        """Check if we've met the quota for all categories."""
-        for cat, target in cache_quota.items():
-            current = category_counts.get(cat, 0)
-            # Bar counts toward interior
-            if cat == "interior":
-                current += min(category_counts.get("bar", 0), max_bar)
-            if current < target:
-                return False
-        return True
+    category_counts["bar"] = 0
+    category_counts["menu"] = 0
+    category_counts["other"] = 0
     
     # Check for cached categories first
     cached_categories = {}
@@ -154,9 +145,9 @@ def categorize_images(
         if photo_name and photo_name in cached_categories and cached_categories[photo_name]:
             category = cached_categories[photo_name]
             categorized.append((img_bytes, category))
-            # Count valid categories
-            if category in valid_categories:
-                category_counts[category] = category_counts.get(category, 0) + 1
+            # Count categories
+            if category in category_counts:
+                category_counts[category] += 1
             print(f"[DEBUG] Using cached category for image {idx}: {category}")
         else:
             # Need to categorize this image
@@ -166,37 +157,40 @@ def categorize_images(
                 indices_to_categorize.append(idx)
             else:
                 categorized.append((img_bytes, "other"))
+                category_counts["other"] += 1
                 print(f"[WARNING] Image {idx} has no bytes and no cached category, defaulting to 'other'")
     
     print(f"[DEBUG] Category counts from cache: {category_counts}")
     
-    # Second pass: categorize images that don't have cached categories
-    # Stop early once quota is met (cost optimization)
+    # Second pass: categorize ALL images that don't have cached categories
     actually_categorized = []
     if images_to_categorize:
-        print(f"[DEBUG] Need to categorize {len(images_to_categorize)} images with AI...")
+        print(f"[DEBUG] Categorizing ALL {len(images_to_categorize)} images with AI...")
         for idx, img_bytes in images_to_categorize:
-            # Check if quota is already met
-            if is_quota_met():
-                print(f"[DEBUG] ✅ Quota met! Stopping categorization early (saved {len(images_to_categorize) - len(actually_categorized)} API calls)")
-                # Mark remaining images as "skipped" (won't be cached)
-                categorized[idx] = (img_bytes, "skipped")
-                continue
-            
             category = categorize_image(img_bytes)
             categorized[idx] = (img_bytes, category)
             actually_categorized.append(idx)
             
-            # Count valid categories
-            if category in valid_categories:
-                category_counts[category] = category_counts.get(category, 0) + 1
+            # Count categories
+            if category in category_counts:
+                category_counts[category] += 1
             
-            print(f"[DEBUG] AI categorized image {idx} as: {category} (counts: {category_counts})")
+            print(f"[DEBUG] AI categorized image {idx} as: {category}")
         
         print(f"[DEBUG] Categorized {len(actually_categorized)} images with AI")
     
+    # Log final category distribution
+    print(f"[DEBUG] Final category distribution: {category_counts}")
+    
+    # Check if quota can be met
+    for cat, target in cache_quota.items():
+        available = category_counts.get(cat, 0)
+        if cat == "interior":
+            available += min(category_counts.get("bar", 0), max_bar)
+        if available < target:
+            print(f"[WARNING] Category '{cat}' has only {available}/{target} images (quota not met)")
+    
     # Store new categories in database if db and place_id are provided
-    # Only store images that were actually categorized (not skipped)
     if db and place_id and photo_names and len(photo_names) == len(images) and actually_categorized:
         try:
             from app.services.database_service import get_cached_images, update_image_tags
@@ -210,7 +204,7 @@ def categorize_images(
                 if idx < len(photo_names) and idx < len(categorized):
                     photo_name = photo_names[idx]
                     _, category = categorized[idx]
-                    if photo_name in photo_to_image and category != "skipped":
+                    if photo_name in photo_to_image:
                         update_image_tags(
                             db, 
                             photo_to_image[photo_name].id, 
@@ -327,7 +321,7 @@ def select_images_by_quota(
     Args:
         categorized_images: List of (image_bytes, category) tuples
         quota: Dict mapping category to desired count. 
-               Default: {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+               Default: {"food": 10, "interior": 10}
         max_bar: Maximum number of bar images allowed (counts toward interior)
         randomize: If True, randomly select within each category
         
@@ -338,7 +332,7 @@ def select_images_by_quota(
     
     # Default quota: 2 exterior, 8 interior, 8 food, 2 drink = 20 total
     if quota is None:
-        quota = {"exterior": 2, "food": 8, "interior": 8, "drink": 2}
+        quota = {"food": 10, "interior": 10}
     
     total_quota = sum(quota.values())
     
