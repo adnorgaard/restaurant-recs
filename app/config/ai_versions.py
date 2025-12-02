@@ -24,9 +24,30 @@ CATEGORY_VERSION = "v1.0"      # Image categorization prompt (interior/exterior/
 TAGS_VERSION = "v1.0"          # AI tags generation prompt
 DESCRIPTION_VERSION = "v1.0"   # Restaurant description prompt
 EMBEDDING_VERSION = "v1.0"     # Embedding generation logic
+QUALITY_VERSION = "v1.0"       # Image quality scoring prompt (people, lighting, blur)
+
+# =============================================================================
+# Quality Scoring Thresholds
+# Images must score ABOVE these thresholds to be displayed (higher = better)
+# 
+# HOW TO ADJUST:
+#   - Increase threshold → Stricter filtering, fewer images pass
+#   - Decrease threshold → More lenient, more images pass
+#
+# SCORE MEANINGS:
+#   - People: 1.0 = no people, 0.0 = people are main subject
+#   - Lighting: 1.0 = well-lit, 0.0 = too dark to see
+#   - Blur: 1.0 = sharp/crisp, 0.0 = very blurry
+#
+# See QUALITY_SCORING.md for full documentation.
+# =============================================================================
+
+QUALITY_PEOPLE_THRESHOLD = 0.6      # Reject if people are clearly the main subject
+QUALITY_LIGHTING_THRESHOLD = 0.5    # Reject if too dark to make out the content
+QUALITY_BLUR_THRESHOLD = 0.5        # Reject if noticeably blurry/out of focus
 
 # Valid component names for version tracking
-VALID_COMPONENTS = {"category", "tags", "description", "embedding"}
+VALID_COMPONENTS = {"category", "tags", "description", "embedding", "quality"}
 
 
 def get_active_version(db: Session, component: str) -> str:
@@ -38,7 +59,7 @@ def get_active_version(db: Session, component: str) -> str:
     
     Args:
         db: Database session
-        component: One of "category", "tags", "description", "embedding"
+        component: One of "category", "tags", "description", "embedding", "quality"
         
     Returns:
         Version string, e.g., "v1.0"
@@ -67,6 +88,7 @@ def get_active_version(db: Session, component: str) -> str:
         "tags": TAGS_VERSION,
         "description": DESCRIPTION_VERSION,
         "embedding": EMBEDDING_VERSION,
+        "quality": QUALITY_VERSION,
     }
     
     return version_map[component]
@@ -94,7 +116,7 @@ def is_version_current(db: Session, component: str, version: Optional[str]) -> b
     
     Args:
         db: Database session
-        component: One of "category", "tags", "description", "embedding"
+        component: One of "category", "tags", "description", "embedding", "quality"
         version: The version to check (can be None for unversioned data)
         
     Returns:
