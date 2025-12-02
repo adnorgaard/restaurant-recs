@@ -479,7 +479,7 @@ def apply_quality_filter_and_select(
     Args:
         db: Database session
         place_id: Restaurant place_id
-        quota: Category quota for selection (default: food=8, interior=8, exterior=2, drink=2)
+        quota: Category quota for selection (default: food=10, interior=10)
         max_workers: Maximum concurrent API calls for scoring
         people_threshold: Minimum people score
         lighting_threshold: Minimum lighting score
@@ -492,7 +492,7 @@ def apply_quality_filter_and_select(
     
     # Default quota
     if quota is None:
-        quota = {"food": 8, "interior": 8, "exterior": 2, "drink": 2}
+        quota = {"food": 10, "interior": 10}
     
     # Step 1 & 2: Score and filter images
     passing_images, all_images = score_and_filter_images_for_restaurant(
@@ -526,4 +526,320 @@ def apply_quality_filter_and_select(
     print(f"[QUALITY] ✅ Selected {len(selected_images)} images for display")
     
     return selected_images
+
+
+# =============================================================================
+# Smart Fetch with Inline Quality Scoring
+# =============================================================================
+
+# Category mapping for SerpAPI
+CATEGORY_CONFIG = {
+    "food": {
+        "serpapi_category_id": "CgIYIA",  # "Food & drink"
+        "serpapi_label": "food",
+    },
+    "interior": {
+        "serpapi_category_id": "CgIYIg",  # "Vibe"
+        "serpapi_label": "interior",
+    },
+}
+
+
+def fetch_and_score_category(
+    db: Session,
+    place_id: str,
+    restaurant_id: int,
+    data_id: str,
+    category: str,
+    quota: int,
+    max_images: int = 30,
+    score_batch_size: int = 5,
+) -> Tuple[int, int, int]:
+    """
+    Fetch images from a category, scoring them inline until quota is met.
+    
+    Args:
+        db: Database session
+        place_id: Google Places ID
+        restaurant_id: Database restaurant ID
+        data_id: SerpAPI data_id
+        category: Category to fetch ("food" or "interior")
+        quota: Target number of quality-passing images
+        max_images: Maximum images to fetch before giving up (default 30)
+        score_batch_size: Number of images to score in parallel (default 5)
+        
+    Returns:
+        Tuple of (quality_passing_count, total_fetched, total_cached)
+    """
+    from app.services.providers.serpapi import SerpApiProvider, GMAPS_CATEGORIES
+    from app.services.storage_service import upload_image_to_gcs, GCS_BUCKET_NAME
+    
+    config = CATEGORY_CONFIG.get(category)
+    if not config:
+        print(f"[FETCH] ❌ Unknown category: {category}")
+        return 0, 0, 0
+    
+    provider = SerpApiProvider()
+    category_id = config["serpapi_category_id"]
+    category_label = config["serpapi_label"]
+    
+    quality_passing = 0
+    total_fetched = 0
+    total_cached = 0
+    next_page_token = None
+    seen_urls = set()
+    
+    current_version = get_active_version(db, "quality")
+    
+    print(f"[FETCH] 🎯 {category}: fetching until {quota} quality images (max {max_images})")
+    
+    while quality_passing < quota and total_fetched < max_images:
+        # Fetch one page
+        photos, next_token, cost = provider.fetch_category_page(
+            data_id=data_id,
+            category_id=category_id,
+            category_label=category_label,
+            next_page_token=next_page_token,
+        )
+        
+        if not photos:
+            print(f"[FETCH] {category}: no more photos available from SerpAPI")
+            break
+        
+        # Filter duplicates
+        new_photos = [p for p in photos if p.image_url not in seen_urls]
+        for p in new_photos:
+            seen_urls.add(p.image_url)
+        
+        if not new_photos:
+            next_page_token = next_token
+            if not next_token:
+                break
+            continue
+        
+        total_fetched += len(new_photos)
+        print(f"[FETCH] {category}: fetched {len(new_photos)} new photos (total: {total_fetched})")
+        
+        # Download, cache, and score in batches
+        for i in range(0, len(new_photos), score_batch_size):
+            if quality_passing >= quota:
+                print(f"[FETCH] {category}: quota met! ({quality_passing}/{quota})")
+                break
+            
+            batch = new_photos[i:i + score_batch_size]
+            
+            # Download images in parallel
+            def download_and_upload(photo):
+                try:
+                    response = requests.get(photo.image_url, timeout=15)
+                    response.raise_for_status()
+                    image_bytes = response.content
+                    
+                    # Generate photo_name from URL
+                    import hashlib
+                    url_hash = hashlib.md5(photo.image_url.encode()).hexdigest()[:16]
+                    photo_name = f"serpapi_{url_hash}"
+                    
+                    # Upload to GCS - returns (public_url, bucket_path) tuple
+                    gcs_result = upload_image_to_gcs(
+                        image_bytes=image_bytes,
+                        place_id=place_id,
+                        photo_name=photo_name,
+                    )
+                    
+                    # Handle both tuple and string returns
+                    if isinstance(gcs_result, tuple):
+                        gcs_url, bucket_path = gcs_result
+                    else:
+                        gcs_url = gcs_result
+                        bucket_path = f"images/{place_id}/{photo_name}.jpg"
+                    
+                    return {
+                        "photo": photo,
+                        "photo_name": photo_name,
+                        "gcs_url": gcs_url,
+                        "bucket_path": bucket_path,
+                        "image_bytes": image_bytes,
+                        "success": True,
+                    }
+                except Exception as e:
+                    print(f"[FETCH] Failed to download/upload: {e}")
+                    return {"photo": photo, "success": False}
+            
+            # Download batch in parallel
+            download_results = []
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(download_and_upload, p) for p in batch]
+                for future in as_completed(futures):
+                    download_results.append(future.result())
+            
+            # Cache successful downloads to database
+            successful = [r for r in download_results if r["success"]]
+            
+            for result in successful:
+                # Create database record directly (we've already uploaded to GCS)
+                photo_category = result["photo"].category if result["photo"].category else category_label
+                
+                # Check if image already exists in database
+                existing = db.query(RestaurantImage).filter(
+                    RestaurantImage.restaurant_id == restaurant_id,
+                    RestaurantImage.photo_name == result["photo_name"],
+                ).first()
+                
+                if existing:
+                    # Update category if needed
+                    if not existing.category and photo_category:
+                        existing.category = photo_category
+                    total_cached += 1
+                    continue
+                
+                # Use bucket_path from upload result
+                gcs_url = result["gcs_url"]
+                bucket_path = result.get("bucket_path", f"images/{place_id}/{result['photo_name']}.jpg")
+                
+                # Create new image record
+                new_image = RestaurantImage(
+                    restaurant_id=restaurant_id,
+                    photo_name=result["photo_name"],
+                    gcs_url=gcs_url,
+                    gcs_bucket_path=bucket_path,
+                    category=photo_category,
+                )
+                db.add(new_image)
+                total_cached += 1
+            
+            db.commit()
+            
+            # Score for quality in parallel
+            def score_single(result):
+                try:
+                    scores = score_image_quality(result["image_bytes"])
+                    return {
+                        "photo_name": result["photo_name"],
+                        "scores": scores,
+                        "passes": scores.passes_thresholds(),
+                    }
+                except Exception as e:
+                    print(f"[FETCH] Failed to score: {e}")
+                    return {"photo_name": result["photo_name"], "scores": None, "passes": False}
+            
+            score_results = []
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(score_single, r) for r in successful]
+                for future in as_completed(futures):
+                    score_results.append(future.result())
+            
+            # Update database with scores
+            for result in score_results:
+                if result["scores"]:
+                    # Find the image in database and update
+                    image = db.query(RestaurantImage).filter(
+                        RestaurantImage.restaurant_id == restaurant_id,
+                        RestaurantImage.photo_name == result["photo_name"],
+                    ).first()
+                    
+                    if image:
+                        image.people_confidence_score = result["scores"].people_score
+                        image.lighting_confidence_score = result["scores"].lighting_score
+                        image.blur_confidence_score = result["scores"].blur_score
+                        image.quality_version = current_version
+                        image.quality_scored_at = datetime.now(timezone.utc)
+                    
+                    if result["passes"]:
+                        quality_passing += 1
+            
+            db.commit()
+            
+            print(f"[FETCH] {category}: scored {len(score_results)}, {sum(1 for r in score_results if r['passes'])} passed (total quality: {quality_passing}/{quota})")
+        
+        # Check if we should continue
+        if quality_passing >= quota:
+            break
+        
+        next_page_token = next_token
+        if not next_token:
+            print(f"[FETCH] {category}: no more pages available")
+            break
+    
+    print(f"[FETCH] {category}: DONE - {quality_passing} quality images from {total_fetched} fetched, {total_cached} cached")
+    return quality_passing, total_fetched, total_cached
+
+
+def smart_fetch_and_score(
+    db: Session,
+    place_id: str,
+    quota: Optional[Dict[str, int]] = None,
+    max_per_category: int = 30,
+) -> Dict[str, int]:
+    """
+    Smart fetch that pulls from specific categories until quotas are met.
+    
+    Fetches from "Food & drink" and "Vibe" categories sequentially,
+    scoring images inline and stopping when quotas are met.
+    
+    Note: Categories are fetched sequentially to avoid SQLAlchemy session
+    threading issues. Within each category, image downloads and scoring
+    are parallelized for speed.
+    
+    Args:
+        db: Database session
+        place_id: Google Places ID
+        quota: Target per category. Default: {"food": 10, "interior": 10}
+        max_per_category: Max images to fetch per category before giving up
+        
+    Returns:
+        Dict with quality counts per category
+    """
+    from app.services.providers.serpapi import SerpApiProvider
+    from app.models.database import Restaurant
+    
+    if quota is None:
+        quota = {"food": 10, "interior": 10}
+    
+    # Get restaurant
+    restaurant = db.query(Restaurant).filter(Restaurant.place_id == place_id).first()
+    if not restaurant:
+        print(f"[FETCH] ❌ Restaurant not found for place_id: {place_id}")
+        return {}
+    
+    # Get SerpAPI data_id
+    provider = SerpApiProvider()
+    try:
+        data_id = provider.get_data_id_for_place(place_id, restaurant.serpapi_data_id)
+        
+        # Cache data_id if not already stored
+        if not restaurant.serpapi_data_id and data_id:
+            restaurant.serpapi_data_id = data_id
+            db.commit()
+    except Exception as e:
+        print(f"[FETCH] ❌ Failed to get SerpAPI data_id: {e}")
+        return {}
+    
+    print(f"[FETCH] 🚀 Smart fetch for {restaurant.name} with quota: {quota}")
+    
+    # Fetch categories sequentially (to avoid SQLAlchemy session threading issues)
+    # Within each category, downloads and scoring are parallelized
+    results = {}
+    
+    for category, target in quota.items():
+        if category in CATEGORY_CONFIG:
+            try:
+                quality_count, fetched, cached = fetch_and_score_category(
+                    db, place_id, restaurant.id, data_id,
+                    category, target, max_per_category,
+                )
+                results[category] = quality_count
+                print(f"[FETCH] ✅ {category}: {quality_count}/{target} quality images")
+            except Exception as e:
+                print(f"[FETCH] ❌ {category} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                results[category] = 0
+    
+    # Summary
+    total_quality = sum(results.values())
+    total_quota = sum(quota.values())
+    print(f"[FETCH] 📊 Summary: {total_quality}/{total_quota} quality images across categories")
+    
+    return results
 
