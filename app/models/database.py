@@ -73,6 +73,13 @@ class RestaurantImage(Base):
     category_updated_at = Column(DateTime(timezone=True), nullable=True)
     tags_version = Column(String, nullable=True)  # e.g., "v1.0"
     tags_updated_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Quality scoring for image filtering (higher = better)
+    people_confidence_score = Column(Float, nullable=True)  # 1.0 = no people as subject, 0.0 = people are main subject
+    lighting_confidence_score = Column(Float, nullable=True)  # 1.0 = well lit, 0.0 = too dark
+    blur_confidence_score = Column(Float, nullable=True)  # 1.0 = sharp, 0.0 = blurry
+    quality_version = Column(String, nullable=True)  # e.g., "v1.0"
+    quality_scored_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationship to restaurant
     restaurant = relationship("Restaurant", back_populates="images")
