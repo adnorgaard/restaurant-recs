@@ -47,6 +47,7 @@ from app.services.database_service import (
     backfill_images_from_gcs,
     mark_images_as_displayed,
     get_displayed_images,
+    image_passes_quality_thresholds,
 )
 from app.services.auth_service import (
     create_user, authenticate_user, get_user_by_email,
@@ -768,18 +769,39 @@ async def test_restaurant(request: TestRequest, db: Session = Depends(get_db)):
         
         # Get photo_names for selected images
         selected_photo_names = [photo_names[i] for i in selected_indices if i < len(photo_names)]
-        print(f"[DEBUG] Selected {len(selected_indices)} images for display")
+        print(f"[DEBUG] Selected {len(selected_indices)} images for display (before quality filter)")
         
-        # Mark selected images as displayed in the database
+        # Apply quality filtering - only mark images that pass quality thresholds as displayed
         if cached_images:
-            photo_name_to_id = {img.photo_name: img.id for img in cached_images}
+            photo_name_to_image = {img.photo_name: img for img in cached_images}
+            
+            # Filter to only quality-passing images
+            quality_passing_photo_names = []
+            quality_failed_count = 0
+            for pn in selected_photo_names:
+                if pn in photo_name_to_image:
+                    img = photo_name_to_image[pn]
+                    if image_passes_quality_thresholds(img):
+                        quality_passing_photo_names.append(pn)
+                    else:
+                        quality_failed_count += 1
+                        print(f"[DEBUG] Image {pn} failed quality (people={img.people_confidence_score}, lighting={img.lighting_confidence_score})")
+            
+            if quality_failed_count > 0:
+                print(f"[DEBUG] Quality filter removed {quality_failed_count} images, {len(quality_passing_photo_names)} passed")
+            
+            # Update selected to only include quality-passing images
+            selected_photo_names = quality_passing_photo_names
+            selected_indices = [i for i in selected_indices if i < len(photo_names) and photo_names[i] in quality_passing_photo_names]
+            
+            # Mark selected images as displayed in the database
             selected_image_ids = [
-                photo_name_to_id[pn] for pn in selected_photo_names 
-                if pn in photo_name_to_id
+                photo_name_to_image[pn].id for pn in selected_photo_names 
+                if pn in photo_name_to_image
             ]
             if selected_image_ids:
                 mark_images_as_displayed(db, place_id, selected_image_ids, reset_others=True)
-                print(f"[DEBUG] Marked {len(selected_image_ids)} images as is_displayed=True")
+                print(f"[DEBUG] Marked {len(selected_image_ids)} quality-passing images as is_displayed=True")
         
         # Run AI analysis on all selected images
         analysis_indices = selected_indices  # Analyze ALL selected images

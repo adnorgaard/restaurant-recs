@@ -325,6 +325,94 @@ class SerpApiProvider(PhotoProvider, PlaceProvider):
         
         return photos, total_cost, api_calls
     
+    def get_data_id_for_place(
+        self,
+        place_id: str,
+        serpapi_data_id: Optional[str] = None,
+    ) -> str:
+        """
+        Public method to get SerpAPI data_id for a place.
+        
+        Args:
+            place_id: Google Places ID
+            serpapi_data_id: Optional cached data_id
+            
+        Returns:
+            SerpAPI data_id string
+        """
+        return self._get_data_id(place_id, serpapi_data_id)
+    
+    def fetch_category_page(
+        self,
+        data_id: str,
+        category_id: str,
+        category_label: str,
+        next_page_token: Optional[str] = None,
+    ) -> Tuple[List[PhotoResult], Optional[str], float]:
+        """
+        Fetch a single page of photos from a category.
+        
+        This allows for incremental fetching with quality scoring between pages.
+        
+        Args:
+            data_id: SerpAPI data_id for the place
+            category_id: Google Maps category ID (e.g., "CgIYIg" for Vibe)
+            category_label: Our category label to assign (e.g., "interior")
+            next_page_token: Token from previous page, or None for first page
+            
+        Returns:
+            Tuple of (photos, next_page_token, cost)
+            next_page_token is None if no more pages available
+        """
+        api_key = self._get_api_key()
+        
+        params = {
+            "engine": "google_maps_photos",
+            "data_id": data_id,
+            "api_key": api_key,
+            "category_id": category_id,
+        }
+        
+        if next_page_token:
+            params["next_page_token"] = next_page_token
+        
+        try:
+            response = requests.get(SERPAPI_BASE_URL, params=params, timeout=15)
+            
+            if response.status_code != 200:
+                print(f"[WARNING] SerpApi error ({response.status_code})")
+                return [], None, self.cost_per_request
+            
+            data = response.json()
+            photo_list = data.get("photos", [])
+            
+            photos = []
+            for photo in photo_list:
+                source = photo.get("source", {})
+                photos.append(PhotoResult(
+                    image_url=photo.get("image", ""),
+                    thumbnail_url=photo.get("thumbnail"),
+                    category=category_label,
+                    source_name=source.get("name"),
+                    date=photo.get("date"),
+                    provider=self.name,
+                    photo_id=photo.get("image", "")[:100],
+                    metadata={
+                        "source_link": source.get("link"),
+                        "source_reviews": source.get("reviews"),
+                        "gmaps_category": category_id,
+                    }
+                ))
+            
+            pagination = data.get("serpapi_pagination", {})
+            next_token = pagination.get("next_page_token")
+            
+            return photos, next_token, self.cost_per_request
+            
+        except Exception as e:
+            print(f"[WARNING] SerpApi page fetch error: {e}")
+            return [], None, self.cost_per_request
+    
     def fetch_photos(
         self,
         place_id: str,

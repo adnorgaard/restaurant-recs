@@ -564,33 +564,51 @@ def process_single_restaurant(
                 duration_seconds=time.time() - start_time
             )
         
-        # Step 3: Ensure we have images (using provider abstraction)
-        cached_images = get_cached_images(db, place_id, max_images=50)
+        # Step 3: Smart fetch with inline quality scoring
+        # This fetches from specific categories, scores each image, and stops when quota is met
+        cached_images = get_cached_images(db, place_id, max_images=100)
         
-        # If refresh_images was used, cached_images will be empty after deletion
-        if refresh_images or not cached_images or len(cached_images) < 20:
-            # Fetch images using PhotoService (supports SerpApi or Google)
+        use_smart_fetch = Component.QUALITY in components and (
+            refresh_images or not cached_images or len(cached_images) < 20
+        )
+        
+        if use_smart_fetch:
+            # Use new smart fetch that scores images inline
+            from app.services.quality_service import smart_fetch_and_score
+            
+            print(f"[SMART FETCH] Using inline quality scoring for {restaurant_name}...")
+            quota = {"food": 10, "interior": 10}
+            
+            quality_results = smart_fetch_and_score(
+                db=db,
+                place_id=place_id,
+                quota=quota,
+                max_per_category=30,
+            )
+            
+            # Refresh cached images after smart fetch
+            cached_images = get_cached_images(db, place_id, max_images=100)
+            
+            if quality_results:
+                components_processed.append("quality")
+                print(f"[SMART FETCH] ✅ Complete: {quality_results}")
+        
+        elif refresh_images or not cached_images or len(cached_images) < 20:
+            # Fallback to old fetch method (when quality component not included)
             try:
                 new_images = photo_service.fetch_and_cache_photos(
                     db=db,
                     place_id=place_id,
                     restaurant_name=restaurant_name,
-                    max_photos=50,  # Pull up to 50 to ensure we meet quota across categories
+                    max_photos=50,
                     restaurant=restaurant,
                 )
                 if new_images:
                     print(f"[PHOTO] Fetched {len(new_images)} photos via {photo_service.photo_provider.name}")
             except (ProviderError, Exception) as e:
-                # Fallback to legacy method if new service fails
-                print(f"[WARNING] PhotoService failed, falling back to legacy: {e}")
-                try:
-                    _, image_urls, photo_names = get_place_images_with_metadata(
-                        place_id, max_images=50, min_required=20, db=db
-                    )
-                except Exception as legacy_error:
-                    print(f"[WARNING] Legacy photo fetch also failed: {legacy_error}")
+                print(f"[WARNING] PhotoService failed: {e}")
             
-            cached_images = get_cached_images(db, place_id, max_images=50)
+            cached_images = get_cached_images(db, place_id, max_images=100)
         
         if not cached_images:
             raise ValueError(f"No images available for restaurant {place_id}")
@@ -659,8 +677,59 @@ def process_single_restaurant(
             print(f"[SKIP] AI categorization disabled - {pre_categorized}/{len(cached_images)} images pre-categorized by SerpAPI")
             components_skipped.append("category")
         
-        # Step 5: Process AI tags and description together
+        # Step 5: Quality scoring and display selection
+        # If smart_fetch was used, scoring is already done - just need to select for display
+        # If smart_fetch was NOT used, need to score existing images
+        quality_selected_images = []
+        
+        if Component.QUALITY in components:
+            from app.services.quality_service import apply_quality_filter_and_select
+            from app.services.database_service import image_passes_quality_thresholds
+            
+            # Check if we already did quality scoring via smart_fetch
+            quality_already_done = "quality" in components_processed
+            
+            if quality_already_done:
+                # Smart fetch already scored images - just select for display
+                print(f"[QUALITY] Using scores from smart fetch, selecting for display...")
+                
+                quality_selected_images = apply_quality_filter_and_select(
+                    db, place_id,
+                    quota={"food": 10, "interior": 10},
+                    max_workers=5,
+                )
+                
+                print(f"[QUALITY] Selected {len(quality_selected_images)} images for display")
+                cached_images = get_cached_images(db, place_id, max_images=100)
+            else:
+                # Need to score existing images (legacy path when smart_fetch not used)
+                images_need_scoring = any(
+                    should_process_image_component(db, img, Component.QUALITY, mode)
+                    for img in cached_images
+                )
+                
+                if images_need_scoring:
+                    print(f"[QUALITY] Scoring existing images for {restaurant_name}...")
+                    
+                    quality_selected_images = apply_quality_filter_and_select(
+                        db, place_id,
+                        quota={"food": 10, "interior": 10},
+                        max_workers=5,
+                    )
+                    
+                    print(f"[QUALITY] Selected {len(quality_selected_images)} images for display")
+                    components_processed.append("quality")
+                    cached_images = get_cached_images(db, place_id, max_images=100)
+                else:
+                    components_skipped.append("quality")
+                    quality_selected_images = [img for img in cached_images if img.is_displayed]
+        else:
+            # Quality not in components - use already-displayed images
+            quality_selected_images = [img for img in cached_images if img.is_displayed]
+        
+        # Step 6: Process AI tags and description together
         # (They use the same API call, so process together for efficiency)
+        # IMPORTANT: Generate tags for quality-selected images (not arbitrary selection)
         process_tags = Component.TAGS in components
         process_description = Component.DESCRIPTION in components
         
@@ -673,12 +742,25 @@ def process_single_restaurant(
         )
         
         if need_tags or need_description:
-            # Select diverse images for analysis
-            categorized = [(b"", img.category or "other") for img in cached_images]
-            quota = {"food": 10, "interior": 10}
-            _, selected_indices = select_images_by_quota(categorized, quota=quota, max_bar=2)
-            
-            selected_images = [cached_images[i] for i in selected_indices if i < len(cached_images)]
+            # Use quality-selected images if available, otherwise select by quota
+            if quality_selected_images:
+                # Use the images that quality scoring selected for display
+                selected_images = quality_selected_images
+                print(f"[TAGS] Using {len(selected_images)} quality-selected images for AI analysis")
+            else:
+                # Fallback: select by quota from all images (when quality not run)
+                # But prefer images that are already displayed
+                displayed_images = [img for img in cached_images if img.is_displayed]
+                if displayed_images and len(displayed_images) >= 5:
+                    selected_images = displayed_images
+                    print(f"[TAGS] Using {len(selected_images)} already-displayed images for AI analysis")
+                else:
+                    # Last resort: select by category quota
+                    categorized = [(b"", img.category or "other") for img in cached_images]
+                    quota = {"food": 10, "interior": 10}
+                    _, selected_indices = select_images_by_quota(categorized, quota=quota, max_bar=2)
+                    selected_images = [cached_images[i] for i in selected_indices if i < len(cached_images)]
+                    print(f"[TAGS] Selected {len(selected_images)} images by category quota for AI analysis")
             
             # Download selected images (PARALLELIZED)
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -749,7 +831,7 @@ def process_single_restaurant(
             if process_description:
                 components_skipped.append("description")
         
-        # Step 6: Generate embedding
+        # Step 7: Generate embedding
         if Component.EMBEDDING in components:
             if should_process_component(db, restaurant, Component.EMBEDDING, mode):
                 embedding_version = get_active_version(db, "embedding")
@@ -767,31 +849,6 @@ def process_single_restaurant(
                 components_processed.append("embedding")
             else:
                 components_skipped.append("embedding")
-        
-        # Step 7: Quality scoring and display selection
-        if Component.QUALITY in components:
-            from app.services.quality_service import apply_quality_filter_and_select
-            
-            # Check if any images need quality scoring
-            images_need_scoring = any(
-                should_process_image_component(db, img, Component.QUALITY, mode)
-                for img in cached_images
-            )
-            
-            if images_need_scoring:
-                print(f"[QUALITY] Running quality scoring for {restaurant_name}...")
-                
-                # This scores images, filters by quality, selects by quota, and sets is_displayed
-                selected_images = apply_quality_filter_and_select(
-                    db, place_id,
-                    quota={"food": 8, "interior": 8, "exterior": 2, "drink": 2},
-                    max_workers=5,
-                )
-                
-                print(f"[QUALITY] Selected {len(selected_images)} images for display")
-                components_processed.append("quality")
-            else:
-                components_skipped.append("quality")
         
         return ProcessingResult(
             place_id=place_id,

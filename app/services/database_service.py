@@ -10,6 +10,49 @@ from app.services.storage_service import (
     get_storage_client,
     GCS_BUCKET_NAME,
 )
+from app.config.ai_versions import (
+    QUALITY_PEOPLE_THRESHOLD,
+    QUALITY_LIGHTING_THRESHOLD,
+    QUALITY_BLUR_THRESHOLD,
+)
+
+
+def image_passes_quality_thresholds(
+    image: "RestaurantImage",
+    people_threshold: float = QUALITY_PEOPLE_THRESHOLD,
+    lighting_threshold: float = QUALITY_LIGHTING_THRESHOLD,
+    blur_threshold: float = QUALITY_BLUR_THRESHOLD,
+) -> bool:
+    """
+    Check if an image passes quality thresholds.
+    
+    An image passes if:
+    1. It has been quality-scored (has scores)
+    2. All scores are above their respective thresholds
+    
+    Args:
+        image: RestaurantImage to check
+        people_threshold: Minimum people score (higher = fewer people)
+        lighting_threshold: Minimum lighting score (higher = better lit)
+        blur_threshold: Minimum blur score (higher = sharper)
+        
+    Returns:
+        True if image passes all quality thresholds, False otherwise
+    """
+    # If not scored yet, fail quality check (require scoring first)
+    if image.people_confidence_score is None:
+        return False
+    if image.lighting_confidence_score is None:
+        return False
+    if image.blur_confidence_score is None:
+        return False
+    
+    # Check all thresholds
+    return (
+        image.people_confidence_score > people_threshold and
+        image.lighting_confidence_score > lighting_threshold and
+        image.blur_confidence_score > blur_threshold
+    )
 
 
 class DatabaseServiceError(Exception):
@@ -845,35 +888,44 @@ def get_complete_cached_restaurant_data(
     ).all()
     
     # If we have displayed images with AI tags, use them directly
+    # BUT only if they all pass quality thresholds (to avoid showing bad images)
     if displayed_images and len(displayed_images) >= 5:
-        images_with_ai_tags = [img for img in displayed_images if img.ai_tags and len(img.ai_tags) > 0]
-        if len(images_with_ai_tags) == len(displayed_images):
-            photo_names_with_tags = [img.photo_name for img in images_with_ai_tags]
-            analysis = get_cached_restaurant_analysis(db, place_id, photo_names_with_tags)
-            if analysis:
-                print(f"[CACHE] ✅ Using pre-selected displayed images for {place_id}")
-                seen_urls = set()
-                image_metadata = []
-                for img in displayed_images:
-                    if img.gcs_url not in seen_urls:
-                        image_metadata.append({
-                            'id': img.id,
-                            'photo_name': img.photo_name,
-                            'gcs_url': img.gcs_url,
-                            'category': img.category.lower() if img.category else 'other',
-                            'ai_tags': img.ai_tags,
-                            'is_displayed': img.is_displayed
-                        })
-                        seen_urls.add(img.gcs_url)
-                
-                return {
-                    'restaurant_name': restaurant.name,
-                    'images': image_metadata,
-                    'image_urls': [img['gcs_url'] for img in image_metadata],
-                    'photo_names': [img['photo_name'] for img in image_metadata],
-                    'categories': {img['photo_name']: img['category'] for img in image_metadata},
-                    'analysis': analysis
-                }
+        # Filter to only images that pass quality thresholds
+        quality_passing = [img for img in displayed_images if image_passes_quality_thresholds(img)]
+        
+        # If some displayed images don't pass quality, we need to re-select
+        if len(quality_passing) < len(displayed_images):
+            print(f"[CACHE] ⚠️ {len(displayed_images) - len(quality_passing)} displayed images fail quality thresholds, re-selecting...")
+            displayed_images = None  # Force re-selection below
+        else:
+            images_with_ai_tags = [img for img in displayed_images if img.ai_tags and len(img.ai_tags) > 0]
+            if len(images_with_ai_tags) == len(displayed_images):
+                photo_names_with_tags = [img.photo_name for img in images_with_ai_tags]
+                analysis = get_cached_restaurant_analysis(db, place_id, photo_names_with_tags)
+                if analysis:
+                    print(f"[CACHE] ✅ Using pre-selected displayed images for {place_id}")
+                    seen_urls = set()
+                    image_metadata = []
+                    for img in displayed_images:
+                        if img.gcs_url not in seen_urls:
+                            image_metadata.append({
+                                'id': img.id,
+                                'photo_name': img.photo_name,
+                                'gcs_url': img.gcs_url,
+                                'category': img.category.lower() if img.category else 'other',
+                                'ai_tags': img.ai_tags,
+                                'is_displayed': img.is_displayed
+                            })
+                            seen_urls.add(img.gcs_url)
+                    
+                    return {
+                        'restaurant_name': restaurant.name,
+                        'images': image_metadata,
+                        'image_urls': [img['gcs_url'] for img in image_metadata],
+                        'photo_names': [img['photo_name'] for img in image_metadata],
+                        'categories': {img['photo_name']: img['category'] for img in image_metadata},
+                        'analysis': analysis
+                    }
     
     # Get all cached images
     cached_images = get_cached_images(db, place_id, max_images)
@@ -885,16 +937,30 @@ def get_complete_cached_restaurant_data(
     # Valid categories for selection (excluding menu, other, skipped)
     valid_categories = {"interior", "exterior", "food", "drink", "bar"}
     
-    # Filter to only valid categories
+    # Filter to only valid categories AND passing quality thresholds
     images_with_valid_categories = [
         img for img in cached_images 
         if img.category and img.category.strip().lower() in valid_categories
     ]
     
+    # Apply quality filtering - only select images that pass quality thresholds
+    quality_passing_images = [
+        img for img in images_with_valid_categories
+        if image_passes_quality_thresholds(img)
+    ]
+    
+    # Log quality filtering stats
+    quality_failed = len(images_with_valid_categories) - len(quality_passing_images)
+    if quality_failed > 0:
+        print(f"[CACHE] 🔍 Quality filter: {quality_failed} images filtered out, {len(quality_passing_images)} passed")
+    
+    # Use quality-passing images for selection
+    images_with_valid_categories = quality_passing_images
+    
     # Only require minimum images, not the full quota (restaurant may have fewer photos)
     min_valid_images = 5
     if len(images_with_valid_categories) < min_valid_images:
-        print(f"[CACHE] ❌ Not enough valid images: {len(images_with_valid_categories)} < {min_valid_images}")
+        print(f"[CACHE] ❌ Not enough quality images: {len(images_with_valid_categories)} < {min_valid_images}")
         return None
     
     # Group images by category for quota-based selection
@@ -905,7 +971,7 @@ def get_complete_cached_restaurant_data(
             by_category[category] = []
         by_category[category].append(img)
     
-    print(f"[CACHE] Categories available: {[(k, len(v)) for k, v in by_category.items()]}")
+    print(f"[CACHE] Categories available (after quality filter): {[(k, len(v)) for k, v in by_category.items()]}")
     
     # Select images based on quota (2 exterior, 8 food, 8 interior, 2 drink)
     # Bar counts as interior (max 2 bar allowed)

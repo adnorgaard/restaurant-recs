@@ -86,17 +86,34 @@ The quality scoring follows **Option B** (recommended):
 ```
 1. Cache ALL images from API (SerpAPI/Google)
      ↓
-2. Score ALL cached images for quality (GPT-4 Vision)
+2. Categorize images (food, interior, exterior, drink, bar, etc.)
      ↓
-3. Filter to images that pass ALL thresholds
+3. Score ALL cached images for quality (GPT-4 Vision)
+   - people_score: Are people the main subject?
+   - lighting_score: Is it well-lit?
+   - blur_score: Is it sharp?
      ↓
-4. Apply quota selection to passing images
-   (e.g., 8 food, 8 interior, 2 exterior, 2 drink = 20 total)
+4. Filter to images that pass ALL thresholds
+   (only quality images proceed)
      ↓
-5. Mark selected images as is_displayed=True
+5. Apply quota selection to QUALITY-PASSING images by category
+   Default quota: 8 food, 8 interior, 2 exterior, 2 drink = 20 total
+   
+   For each category:
+   - Take up to N images from quality-passing images in that category
+   - If a category doesn't have enough quality images, remaining slots
+     are filled from other quality-passing categories
+     ↓
+6. Mark selected images as is_displayed=True
+     ↓
+7. Generate AI tags/description for the DISPLAYED images
+   (ensures tags match what's actually shown)
 ```
 
-This ensures we always try to fill the display quota with quality images.
+**Key point**: Quota selection happens AFTER quality filtering. This ensures:
+- All displayed images pass quality thresholds
+- Categories are filled with the best available images
+- AI tags are generated for exactly the images being displayed
 
 ## Usage
 
