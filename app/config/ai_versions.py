@@ -24,7 +24,7 @@ CATEGORY_VERSION = "v1.0"      # Image categorization prompt (interior/exterior/
 TAGS_VERSION = "v1.0"          # AI tags generation prompt
 DESCRIPTION_VERSION = "v1.0"   # Restaurant description prompt
 EMBEDDING_VERSION = "v1.0"     # Embedding generation logic
-QUALITY_VERSION = "v1.0"       # Image quality scoring prompt (people, lighting, blur)
+QUALITY_VERSION = "v1.1"       # Image quality scoring prompt (people, image_quality, time_of_day, indoor_outdoor)
 
 # =============================================================================
 # Quality Scoring Thresholds
@@ -36,15 +36,18 @@ QUALITY_VERSION = "v1.0"       # Image quality scoring prompt (people, lighting,
 #
 # SCORE MEANINGS:
 #   - People: 1.0 = no people, 0.0 = people are main subject
-#   - Lighting: 1.0 = well-lit, 0.0 = too dark to see
-#   - Blur: 1.0 = sharp/crisp, 0.0 = very blurry
+#   - Image Quality: 1.0 = clear/sharp/visible, 0.0 = unusable
 #
 # See QUALITY_SCORING.md for full documentation.
 # =============================================================================
 
 QUALITY_PEOPLE_THRESHOLD = 0.6      # Reject if people are clearly the main subject
-QUALITY_LIGHTING_THRESHOLD = 0.5    # Reject if too dark to make out the content
-QUALITY_BLUR_THRESHOLD = 0.5        # Reject if noticeably blurry/out of focus
+IMAGE_QUALITY_THRESHOLD = 0.5       # Reject if image is not clear enough to display
+
+# DEPRECATED thresholds (kept for backwards compatibility, no longer used)
+# These were replaced by IMAGE_QUALITY_THRESHOLD in v1.1
+QUALITY_LIGHTING_THRESHOLD = 0.5    # DEPRECATED - use IMAGE_QUALITY_THRESHOLD
+QUALITY_BLUR_THRESHOLD = 0.5        # DEPRECATED - use IMAGE_QUALITY_THRESHOLD
 
 # Valid component names for version tracking
 VALID_COMPONENTS = {"category", "tags", "description", "embedding", "quality"}

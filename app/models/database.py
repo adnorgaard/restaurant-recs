@@ -76,9 +76,18 @@ class RestaurantImage(Base):
     
     # Quality scoring for image filtering (higher = better)
     people_confidence_score = Column(Float, nullable=True)  # 1.0 = no people as subject, 0.0 = people are main subject
-    lighting_confidence_score = Column(Float, nullable=True)  # 1.0 = well lit, 0.0 = too dark
-    blur_confidence_score = Column(Float, nullable=True)  # 1.0 = sharp, 0.0 = blurry
-    quality_version = Column(String, nullable=True)  # e.g., "v1.0"
+    image_quality_score = Column(Float, nullable=True)  # 1.0 = clear/sharp, 0.0 = unusable (combined lighting+blur)
+    
+    # DEPRECATED (as of v1.1): Use image_quality_score instead
+    # These columns are kept for historical data but are no longer written to.
+    lighting_confidence_score = Column(Float, nullable=True)  # DEPRECATED - 1.0 = well lit, 0.0 = too dark
+    blur_confidence_score = Column(Float, nullable=True)  # DEPRECATED - 1.0 = sharp, 0.0 = blurry
+    
+    # Image metadata tags
+    time_of_day = Column(String, nullable=True)  # "day", "night", "unknown"
+    indoor_outdoor = Column(String, nullable=True)  # "indoor", "outdoor", "unknown"
+    
+    quality_version = Column(String, nullable=True)  # e.g., "v1.1"
     quality_scored_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationship to restaurant

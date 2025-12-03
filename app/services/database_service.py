@@ -12,16 +12,14 @@ from app.services.storage_service import (
 )
 from app.config.ai_versions import (
     QUALITY_PEOPLE_THRESHOLD,
-    QUALITY_LIGHTING_THRESHOLD,
-    QUALITY_BLUR_THRESHOLD,
+    IMAGE_QUALITY_THRESHOLD,
 )
 
 
 def image_passes_quality_thresholds(
     image: "RestaurantImage",
     people_threshold: float = QUALITY_PEOPLE_THRESHOLD,
-    lighting_threshold: float = QUALITY_LIGHTING_THRESHOLD,
-    blur_threshold: float = QUALITY_BLUR_THRESHOLD,
+    image_quality_threshold: float = IMAGE_QUALITY_THRESHOLD,
 ) -> bool:
     """
     Check if an image passes quality thresholds.
@@ -33,8 +31,7 @@ def image_passes_quality_thresholds(
     Args:
         image: RestaurantImage to check
         people_threshold: Minimum people score (higher = fewer people)
-        lighting_threshold: Minimum lighting score (higher = better lit)
-        blur_threshold: Minimum blur score (higher = sharper)
+        image_quality_threshold: Minimum image quality score (higher = clearer)
         
     Returns:
         True if image passes all quality thresholds, False otherwise
@@ -42,16 +39,13 @@ def image_passes_quality_thresholds(
     # If not scored yet, fail quality check (require scoring first)
     if image.people_confidence_score is None:
         return False
-    if image.lighting_confidence_score is None:
-        return False
-    if image.blur_confidence_score is None:
+    if image.image_quality_score is None:
         return False
     
     # Check all thresholds
     return (
         image.people_confidence_score > people_threshold and
-        image.lighting_confidence_score > lighting_threshold and
-        image.blur_confidence_score > blur_threshold
+        image.image_quality_score > image_quality_threshold
     )
 
 

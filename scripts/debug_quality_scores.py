@@ -37,8 +37,7 @@ from app.database import SessionLocal
 from app.models.database import Restaurant, RestaurantImage
 from app.config.ai_versions import (
     QUALITY_PEOPLE_THRESHOLD,
-    QUALITY_LIGHTING_THRESHOLD,
-    QUALITY_BLUR_THRESHOLD,
+    IMAGE_QUALITY_THRESHOLD,
 )
 
 
@@ -69,9 +68,8 @@ def show_images_for_restaurant(db, place_id: str, filter_type: str = None):
     print(f"{'='*80}")
     
     print(f"\nThresholds:")
-    print(f"  People:   > {QUALITY_PEOPLE_THRESHOLD} (to pass)")
-    print(f"  Lighting: > {QUALITY_LIGHTING_THRESHOLD} (to pass)")
-    print(f"  Blur:     > {QUALITY_BLUR_THRESHOLD} (to pass)")
+    print(f"  People:        > {QUALITY_PEOPLE_THRESHOLD} (to pass)")
+    print(f"  Image Quality: > {IMAGE_QUALITY_THRESHOLD} (to pass)")
     
     images = db.query(RestaurantImage).filter(
         RestaurantImage.restaurant_id == restaurant.id
@@ -97,11 +95,10 @@ def show_images_for_restaurant(db, place_id: str, filter_type: str = None):
     failed = []
     
     for img in scored:
-        passes_people = img.people_confidence_score > QUALITY_PEOPLE_THRESHOLD
-        passes_lighting = img.lighting_confidence_score > QUALITY_LIGHTING_THRESHOLD
-        passes_blur = img.blur_confidence_score > QUALITY_BLUR_THRESHOLD
+        passes_people = img.people_confidence_score is not None and img.people_confidence_score > QUALITY_PEOPLE_THRESHOLD
+        passes_quality = img.image_quality_score is not None and img.image_quality_score > IMAGE_QUALITY_THRESHOLD
         
-        if passes_people and passes_lighting and passes_blur:
+        if passes_people and passes_quality:
             passed.append(img)
         else:
             failed.append(img)
@@ -124,18 +121,20 @@ def show_images_for_restaurant(db, place_id: str, filter_type: str = None):
     print("-" * 80)
     
     for img in images_to_show:
-        passes_people = img.people_confidence_score > QUALITY_PEOPLE_THRESHOLD
-        passes_lighting = img.lighting_confidence_score > QUALITY_LIGHTING_THRESHOLD
-        passes_blur = img.blur_confidence_score > QUALITY_BLUR_THRESHOLD
+        passes_people = img.people_confidence_score is not None and img.people_confidence_score > QUALITY_PEOPLE_THRESHOLD
+        passes_quality = img.image_quality_score is not None and img.image_quality_score > IMAGE_QUALITY_THRESHOLD
         
-        status = "✅ PASS" if (passes_people and passes_lighting and passes_blur) else "❌ FAIL"
+        status = "✅ PASS" if (passes_people and passes_quality) else "❌ FAIL"
         displayed_mark = "📺" if img.is_displayed else "  "
         
         print(f"\n{displayed_mark} Image ID: {img.id} | Category: {img.category or 'N/A'}")
         print(f"   {status}")
-        print(f"   People:   {img.people_confidence_score:.2f} {'✅' if passes_people else '❌'} (need > {QUALITY_PEOPLE_THRESHOLD})")
-        print(f"   Lighting: {img.lighting_confidence_score:.2f} {'✅' if passes_lighting else '❌'} (need > {QUALITY_LIGHTING_THRESHOLD})")
-        print(f"   Blur:     {img.blur_confidence_score:.2f} {'✅' if passes_blur else '❌'} (need > {QUALITY_BLUR_THRESHOLD})")
+        people_str = f"{img.people_confidence_score:.2f}" if img.people_confidence_score is not None else "N/A"
+        quality_str = f"{img.image_quality_score:.2f}" if img.image_quality_score is not None else "N/A"
+        print(f"   People:        {people_str:>5} {'✅' if passes_people else '❌'} (need > {QUALITY_PEOPLE_THRESHOLD})")
+        print(f"   Image Quality: {quality_str:>5} {'✅' if passes_quality else '❌'} (need > {IMAGE_QUALITY_THRESHOLD})")
+        print(f"   Time of Day:   {img.time_of_day or 'N/A'}")
+        print(f"   Indoor/Outdoor: {img.indoor_outdoor or 'N/A'}")
         print(f"   URL: {img.gcs_url}")
 
 
@@ -167,6 +166,8 @@ def show_score_distribution(db):
     
     for img in images:
         score = img.people_confidence_score
+        if score is None:
+            continue
         if score <= 0.3:
             people_ranges["0.0-0.3 (people dominant)"] += 1
         elif score <= 0.5:
@@ -179,65 +180,91 @@ def show_score_distribution(db):
             people_ranges["0.9-1.0 (no people)"] += 1
     
     for range_name, count in people_ranges.items():
-        bar = "█" * int(count / len(images) * 40)
-        pct = count / len(images) * 100
+        bar = "█" * int(count / len(images) * 40) if len(images) > 0 else ""
+        pct = count / len(images) * 100 if len(images) > 0 else 0
         print(f"    {range_name}: {count:4d} ({pct:5.1f}%) {bar}")
     
-    # Lighting score distribution
-    print("\nLIGHTING SCORE (1.0 = well lit, 0.0 = too dark):")
-    print(f"  Threshold: > {QUALITY_LIGHTING_THRESHOLD}")
+    # Image quality score distribution
+    print("\nIMAGE QUALITY SCORE (1.0 = excellent, 0.0 = unusable):")
+    print(f"  Threshold: > {IMAGE_QUALITY_THRESHOLD}")
     
-    lighting_ranges = {
-        "0.0-0.3 (very dark)": 0,
-        "0.3-0.5 (dark)": 0,
+    quality_ranges = {
+        "0.0-0.3 (poor)": 0,
+        "0.3-0.5 (below threshold)": 0,
         "0.5-0.7 (adequate)": 0,
         "0.7-0.9 (good)": 0,
         "0.9-1.0 (excellent)": 0,
     }
     
     for img in images:
-        score = img.lighting_confidence_score
+        score = img.image_quality_score
+        if score is None:
+            continue
         if score <= 0.3:
-            lighting_ranges["0.0-0.3 (very dark)"] += 1
+            quality_ranges["0.0-0.3 (poor)"] += 1
         elif score <= 0.5:
-            lighting_ranges["0.3-0.5 (dark)"] += 1
+            quality_ranges["0.3-0.5 (below threshold)"] += 1
         elif score <= 0.7:
-            lighting_ranges["0.5-0.7 (adequate)"] += 1
+            quality_ranges["0.5-0.7 (adequate)"] += 1
         elif score <= 0.9:
-            lighting_ranges["0.7-0.9 (good)"] += 1
+            quality_ranges["0.7-0.9 (good)"] += 1
         else:
-            lighting_ranges["0.9-1.0 (excellent)"] += 1
+            quality_ranges["0.9-1.0 (excellent)"] += 1
     
-    for range_name, count in lighting_ranges.items():
-        bar = "█" * int(count / len(images) * 40)
-        pct = count / len(images) * 100
+    for range_name, count in quality_ranges.items():
+        bar = "█" * int(count / len(images) * 40) if len(images) > 0 else ""
+        pct = count / len(images) * 100 if len(images) > 0 else 0
         print(f"    {range_name}: {count:4d} ({pct:5.1f}%) {bar}")
+    
+    # Time of day distribution
+    print("\nTIME OF DAY DISTRIBUTION:")
+    time_counts = {"day": 0, "night": 0, "unknown": 0, "N/A": 0}
+    for img in images:
+        if img.time_of_day in time_counts:
+            time_counts[img.time_of_day] += 1
+        else:
+            time_counts["N/A"] += 1
+    
+    for tod, count in time_counts.items():
+        bar = "█" * int(count / len(images) * 40) if len(images) > 0 else ""
+        pct = count / len(images) * 100 if len(images) > 0 else 0
+        print(f"    {tod:10s}: {count:4d} ({pct:5.1f}%) {bar}")
+    
+    # Indoor/outdoor distribution
+    print("\nINDOOR/OUTDOOR DISTRIBUTION:")
+    io_counts = {"indoor": 0, "outdoor": 0, "unknown": 0, "N/A": 0}
+    for img in images:
+        if img.indoor_outdoor in io_counts:
+            io_counts[img.indoor_outdoor] += 1
+        else:
+            io_counts["N/A"] += 1
+    
+    for io, count in io_counts.items():
+        bar = "█" * int(count / len(images) * 40) if len(images) > 0 else ""
+        pct = count / len(images) * 100 if len(images) > 0 else 0
+        print(f"    {io:10s}: {count:4d} ({pct:5.1f}%) {bar}")
     
     # Pass/fail summary
     print("\n" + "="*80)
     print("PASS/FAIL SUMMARY")
     
-    passed = failed_people = failed_lighting = failed_blur = 0
+    passed = failed_people = failed_quality = 0
     
     for img in images:
-        passes_people = img.people_confidence_score > QUALITY_PEOPLE_THRESHOLD
-        passes_lighting = img.lighting_confidence_score > QUALITY_LIGHTING_THRESHOLD
-        passes_blur = img.blur_confidence_score > QUALITY_BLUR_THRESHOLD
+        passes_people = img.people_confidence_score is not None and img.people_confidence_score > QUALITY_PEOPLE_THRESHOLD
+        passes_quality = img.image_quality_score is not None and img.image_quality_score > IMAGE_QUALITY_THRESHOLD
         
-        if passes_people and passes_lighting and passes_blur:
+        if passes_people and passes_quality:
             passed += 1
         else:
             if not passes_people:
                 failed_people += 1
-            if not passes_lighting:
-                failed_lighting += 1
-            if not passes_blur:
-                failed_blur += 1
+            if not passes_quality:
+                failed_quality += 1
     
-    print(f"\n  Passed all thresholds:  {passed:4d} ({passed/len(images)*100:.1f}%)")
-    print(f"  Failed people filter:   {failed_people:4d} ({failed_people/len(images)*100:.1f}%)")
-    print(f"  Failed lighting filter: {failed_lighting:4d} ({failed_lighting/len(images)*100:.1f}%)")
-    print(f"  Failed blur filter:     {failed_blur:4d} ({failed_blur/len(images)*100:.1f}%)")
+    print(f"\n  Passed all thresholds:       {passed:4d} ({passed/len(images)*100:.1f}%)")
+    print(f"  Failed people filter:        {failed_people:4d} ({failed_people/len(images)*100:.1f}%)")
+    print(f"  Failed image quality filter: {failed_quality:4d} ({failed_quality/len(images)*100:.1f}%)")
 
 
 def show_people_edge_cases(db, limit: int = 20):
@@ -282,9 +309,10 @@ def rescore_image(db, image_id: int):
     
     print(f"\nCurrent scores:")
     if image.quality_version:
-        print(f"  People:   {image.people_confidence_score:.2f}")
-        print(f"  Lighting: {image.lighting_confidence_score:.2f}")
-        print(f"  Blur:     {image.blur_confidence_score:.2f}")
+        print(f"  People:        {image.people_confidence_score:.2f if image.people_confidence_score else 'N/A'}")
+        print(f"  Image Quality: {image.image_quality_score:.2f if image.image_quality_score else 'N/A'}")
+        print(f"  Time of Day:   {image.time_of_day or 'N/A'}")
+        print(f"  Indoor/Outdoor: {image.indoor_outdoor or 'N/A'}")
     else:
         print("  (not yet scored)")
     
@@ -295,9 +323,10 @@ def rescore_image(db, image_id: int):
         scores = score_image_quality_from_url(image.gcs_url)
         
         print(f"\nNew scores:")
-        print(f"  People:   {scores.people_score:.2f}")
-        print(f"  Lighting: {scores.lighting_score:.2f}")
-        print(f"  Blur:     {scores.blur_score:.2f}")
+        print(f"  People:        {scores.people_score:.2f}")
+        print(f"  Image Quality: {scores.image_quality_score:.2f}")
+        print(f"  Time of Day:   {scores.time_of_day}")
+        print(f"  Indoor/Outdoor: {scores.indoor_outdoor}")
         
         passes = scores.passes_thresholds()
         print(f"\nWould pass: {'✅ YES' if passes else '❌ NO'}")
@@ -333,9 +362,10 @@ def show_displayed_images_with_low_scores(db, limit: int = 30):
         print(f"\nImage ID: {img.id}")
         print(f"  Restaurant: {restaurant.name if restaurant else 'N/A'}")
         print(f"  Category: {img.category or 'N/A'}")
-        print(f"  People:   {img.people_confidence_score:.2f}")
-        print(f"  Lighting: {img.lighting_confidence_score:.2f}")
-        print(f"  Blur:     {img.blur_confidence_score:.2f}")
+        print(f"  People:        {img.people_confidence_score:.2f if img.people_confidence_score else 'N/A'}")
+        print(f"  Image Quality: {img.image_quality_score:.2f if img.image_quality_score else 'N/A'}")
+        print(f"  Time of Day:   {img.time_of_day or 'N/A'}")
+        print(f"  Indoor/Outdoor: {img.indoor_outdoor or 'N/A'}")
         print(f"  URL: {img.gcs_url}")
 
 
@@ -387,4 +417,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

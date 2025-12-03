@@ -6,13 +6,15 @@ before displaying them on the website.
 
 SCORING METRICS (all 0.0-1.0, higher = better):
 - People: Is a person the main subject? (1.0 = no people, 0.0 = people are focus)
-- Lighting: Is the image well-lit? (1.0 = bright/clear, 0.0 = too dark)
-- Blur: Is the image sharp? (1.0 = crisp, 0.0 = blurry)
+- Image Quality: Is the image clear enough to display? (1.0 = clear/sharp, 0.0 = unusable)
+
+METADATA TAGS (for future filtering):
+- Time of Day: "day", "night", "unknown"
+- Indoor/Outdoor: "indoor", "outdoor", "unknown"
 
 THRESHOLDS (configured in app/config/ai_versions.py):
 - QUALITY_PEOPLE_THRESHOLD = 0.6 (reject if people are main subject)
-- QUALITY_LIGHTING_THRESHOLD = 0.5 (reject if too dark)
-- QUALITY_BLUR_THRESHOLD = 0.5 (reject if too blurry)
+- IMAGE_QUALITY_THRESHOLD = 0.5 (reject if image not clear enough)
 
 PROCESSING FLOW (Option B):
 1. Cache ALL images from API
@@ -42,8 +44,7 @@ from app.models.database import RestaurantImage
 from app.config.ai_versions import (
     QUALITY_VERSION,
     QUALITY_PEOPLE_THRESHOLD,
-    QUALITY_LIGHTING_THRESHOLD,
-    QUALITY_BLUR_THRESHOLD,
+    IMAGE_QUALITY_THRESHOLD,
     get_active_version,
 )
 
@@ -64,53 +65,67 @@ class QualityServiceError(Exception):
 class QualityScores:
     """Quality scores for an image."""
     people_score: float  # 1.0 = no people as subject, 0.0 = people are main subject
-    lighting_score: float  # 1.0 = well lit, 0.0 = too dark
-    blur_score: float  # 1.0 = sharp, 0.0 = blurry
+    image_quality_score: float  # 1.0 = clear/sharp, 0.0 = unusable
+    time_of_day: str  # "day", "night", "unknown"
+    indoor_outdoor: str  # "indoor", "outdoor", "unknown"
     
     def passes_thresholds(
         self,
         people_threshold: float = QUALITY_PEOPLE_THRESHOLD,
-        lighting_threshold: float = QUALITY_LIGHTING_THRESHOLD,
-        blur_threshold: float = QUALITY_BLUR_THRESHOLD,
+        image_quality_threshold: float = IMAGE_QUALITY_THRESHOLD,
     ) -> bool:
         """Check if all scores pass the configured thresholds."""
         return (
             self.people_score > people_threshold and
-            self.lighting_score > lighting_threshold and
-            self.blur_score > blur_threshold
+            self.image_quality_score > image_quality_threshold
         )
     
-    def to_dict(self) -> Dict[str, float]:
+    def to_dict(self) -> Dict[str, any]:
         return {
             "people_score": self.people_score,
-            "lighting_score": self.lighting_score,
-            "blur_score": self.blur_score,
+            "image_quality_score": self.image_quality_score,
+            "time_of_day": self.time_of_day,
+            "indoor_outdoor": self.indoor_outdoor,
         }
 
 
-# Quality scoring prompt - single API call for all three metrics
-QUALITY_SCORING_PROMPT = """Analyze this restaurant image for quality metrics. Rate each on a scale of 0.0 to 1.0:
+# Quality scoring prompt - single API call for all metrics
+QUALITY_SCORING_PROMPT = """Analyze this restaurant image. Provide scores from 0.0 to 1.0:
 
 1. PEOPLE_SCORE: How much are people NOT the main subject?
    - 1.0 = No people visible, or people are minor background elements
-   - 0.7 = People visible but not the focus (e.g., diners in background, staff partially visible)
-   - 0.4 = People are prominent but sharing focus with food/interior
    - 0.0 = People are clearly the main subject (portrait, group photo, selfie)
+   
+   Score continuously between 0.0 and 1.0.
 
-2. LIGHTING_SCORE: How well-lit and visible is the content?
-   - 1.0 = Well-lit, all details clearly visible
-   - 0.7 = Adequately lit, can see what's happening (dim ambient lighting is OK if intentional)
-   - 0.4 = Somewhat dark but main subject still discernible
-   - 0.0 = Too dark to make out what's in the image
+2. IMAGE_QUALITY_SCORE: Is this image clear enough to display on a restaurant website?
+   
+   Consider: Can a viewer clearly see and appreciate the content?
+   - Is the subject visible and identifiable?
+   - Is it reasonably sharp/in focus?
+   - Can you see important details (textures, colors, shapes)?
+   
+   - 1.0 = Excellent - sharp, clear, all details visible
+   - 0.0 = Unusable - cannot make out what's in the image
+   
+   Score continuously between 0.0 and 1.0.
+   
+   Do NOT penalize:
+   - Ambient, moody, or nighttime lighting (if content is still visible)
+   - Minor grain or noise (if content is still clear)
 
-3. BLUR_SCORE: How sharp/in-focus is the image?
-   - 1.0 = Sharp and crisp, good focus
-   - 0.7 = Mostly sharp, minor softness acceptable
-   - 0.4 = Noticeable blur but subject still identifiable
-   - 0.0 = Very blurry, motion blur, or completely out of focus
+3. TIME_OF_DAY: When does this appear to be taken?
+   - "day" = Daytime (natural daylight visible)
+   - "night" = Nighttime (dark outside or evening ambiance, etc.)
+   - "unknown" = Cannot determine
+
+4. INDOOR_OUTDOOR: Where was this taken?
+   - "indoor" = Inside a building
+   - "outdoor" = Outside
+   - "unknown" = Cannot determine
 
 Respond in JSON format only:
-{"people_score": 0.0, "lighting_score": 0.0, "blur_score": 0.0}"""
+{"people_score": 0.0, "image_quality_score": 0.0, "time_of_day": "unknown", "indoor_outdoor": "unknown"}"""
 
 
 def score_image_quality(image_bytes: bytes) -> QualityScores:
@@ -121,7 +136,7 @@ def score_image_quality(image_bytes: bytes) -> QualityScores:
         image_bytes: Image data as bytes
         
     Returns:
-        QualityScores with people, lighting, and blur scores
+        QualityScores with people_score, image_quality_score, time_of_day, indoor_outdoor
         
     Raises:
         QualityServiceError: If scoring fails
@@ -151,7 +166,7 @@ def score_image_quality(image_bytes: bytes) -> QualityScores:
                     ]
                 }
             ],
-            max_tokens=100,
+            max_tokens=150,
             temperature=0.1  # Low temperature for consistent scoring
         )
         
@@ -168,13 +183,22 @@ def score_image_quality(image_bytes: bytes) -> QualityScores:
         
         # Validate and clamp scores to 0.0-1.0 range
         people_score = max(0.0, min(1.0, float(result.get("people_score", 0.5))))
-        lighting_score = max(0.0, min(1.0, float(result.get("lighting_score", 0.5))))
-        blur_score = max(0.0, min(1.0, float(result.get("blur_score", 0.5))))
+        image_quality_score = max(0.0, min(1.0, float(result.get("image_quality_score", 0.5))))
+        
+        # Validate string fields
+        time_of_day = result.get("time_of_day", "unknown")
+        if time_of_day not in ("day", "night", "unknown"):
+            time_of_day = "unknown"
+        
+        indoor_outdoor = result.get("indoor_outdoor", "unknown")
+        if indoor_outdoor not in ("indoor", "outdoor", "unknown"):
+            indoor_outdoor = "unknown"
         
         return QualityScores(
             people_score=people_score,
-            lighting_score=lighting_score,
-            blur_score=blur_score,
+            image_quality_score=image_quality_score,
+            time_of_day=time_of_day,
+            indoor_outdoor=indoor_outdoor,
         )
         
     except json.JSONDecodeError as e:
@@ -272,8 +296,9 @@ def update_image_quality_scores(
         raise QualityServiceError(f"Image not found: {image_id}")
     
     image.people_confidence_score = scores.people_score
-    image.lighting_confidence_score = scores.lighting_score
-    image.blur_confidence_score = scores.blur_score
+    image.image_quality_score = scores.image_quality_score
+    image.time_of_day = scores.time_of_day
+    image.indoor_outdoor = scores.indoor_outdoor
     image.quality_version = version or QUALITY_VERSION
     image.quality_scored_at = datetime.now(timezone.utc)
     
@@ -349,8 +374,7 @@ def get_displayable_images(
     db: Session,
     place_id: str,
     people_threshold: float = QUALITY_PEOPLE_THRESHOLD,
-    lighting_threshold: float = QUALITY_LIGHTING_THRESHOLD,
-    blur_threshold: float = QUALITY_BLUR_THRESHOLD,
+    image_quality_threshold: float = IMAGE_QUALITY_THRESHOLD,
 ) -> List[RestaurantImage]:
     """
     Get images that pass quality thresholds and can be displayed.
@@ -359,8 +383,7 @@ def get_displayable_images(
         db: Database session
         place_id: Restaurant place_id
         people_threshold: Minimum people score
-        lighting_threshold: Minimum lighting score
-        blur_threshold: Minimum blur score
+        image_quality_threshold: Minimum image quality score
         
     Returns:
         List of RestaurantImage records that pass all thresholds
@@ -370,8 +393,7 @@ def get_displayable_images(
     return db.query(RestaurantImage).join(Restaurant).filter(
         Restaurant.place_id == place_id,
         RestaurantImage.people_confidence_score > people_threshold,
-        RestaurantImage.lighting_confidence_score > lighting_threshold,
-        RestaurantImage.blur_confidence_score > blur_threshold,
+        RestaurantImage.image_quality_score > image_quality_threshold,
     ).all()
 
 
@@ -380,8 +402,7 @@ def score_and_filter_images_for_restaurant(
     place_id: str,
     max_workers: int = 5,
     people_threshold: float = QUALITY_PEOPLE_THRESHOLD,
-    lighting_threshold: float = QUALITY_LIGHTING_THRESHOLD,
-    blur_threshold: float = QUALITY_BLUR_THRESHOLD,
+    image_quality_threshold: float = IMAGE_QUALITY_THRESHOLD,
 ) -> Tuple[List[RestaurantImage], List[RestaurantImage]]:
     """
     Score all images for a restaurant and determine which pass quality thresholds.
@@ -397,8 +418,7 @@ def score_and_filter_images_for_restaurant(
         place_id: Restaurant place_id
         max_workers: Maximum concurrent API calls
         people_threshold: Minimum people score to pass
-        lighting_threshold: Minimum lighting score to pass
-        blur_threshold: Minimum blur score to pass
+        image_quality_threshold: Minimum image quality score to pass
         
     Returns:
         Tuple of (images_passing_quality, all_images_with_scores)
@@ -445,11 +465,9 @@ def score_and_filter_images_for_restaurant(
     for img in all_images:
         if (
             img.people_confidence_score is not None and
-            img.lighting_confidence_score is not None and
-            img.blur_confidence_score is not None and
+            img.image_quality_score is not None and
             img.people_confidence_score > people_threshold and
-            img.lighting_confidence_score > lighting_threshold and
-            img.blur_confidence_score > blur_threshold
+            img.image_quality_score > image_quality_threshold
         ):
             passing_images.append(img)
     
@@ -464,8 +482,7 @@ def apply_quality_filter_and_select(
     quota: Optional[Dict[str, int]] = None,
     max_workers: int = 5,
     people_threshold: float = QUALITY_PEOPLE_THRESHOLD,
-    lighting_threshold: float = QUALITY_LIGHTING_THRESHOLD,
-    blur_threshold: float = QUALITY_BLUR_THRESHOLD,
+    image_quality_threshold: float = IMAGE_QUALITY_THRESHOLD,
 ) -> List[RestaurantImage]:
     """
     Full quality filtering flow: score images, filter by quality, then select by quota.
@@ -482,8 +499,7 @@ def apply_quality_filter_and_select(
         quota: Category quota for selection (default: food=10, interior=10)
         max_workers: Maximum concurrent API calls for scoring
         people_threshold: Minimum people score
-        lighting_threshold: Minimum lighting score
-        blur_threshold: Minimum blur score
+        image_quality_threshold: Minimum image quality score
         
     Returns:
         List of RestaurantImage records selected for display
@@ -497,7 +513,7 @@ def apply_quality_filter_and_select(
     # Step 1 & 2: Score and filter images
     passing_images, all_images = score_and_filter_images_for_restaurant(
         db, place_id, max_workers,
-        people_threshold, lighting_threshold, blur_threshold
+        people_threshold, image_quality_threshold
     )
     
     if not passing_images:
@@ -740,8 +756,9 @@ def fetch_and_score_category(
                     
                     if image:
                         image.people_confidence_score = result["scores"].people_score
-                        image.lighting_confidence_score = result["scores"].lighting_score
-                        image.blur_confidence_score = result["scores"].blur_score
+                        image.image_quality_score = result["scores"].image_quality_score
+                        image.time_of_day = result["scores"].time_of_day
+                        image.indoor_outdoor = result["scores"].indoor_outdoor
                         image.quality_version = current_version
                         image.quality_scored_at = datetime.now(timezone.utc)
                     
