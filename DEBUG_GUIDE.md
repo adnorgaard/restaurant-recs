@@ -131,3 +131,35 @@ If second request is > 1 second, check:
 - Are images being downloaded unnecessarily?
 - Is AI analysis running when it shouldn't?
 
+## Quality Score Debugging
+
+Use the dedicated quality score debug script to analyze image scoring:
+
+```bash
+# Show score distribution across all images
+python scripts/debug_quality_scores.py --distribution
+
+# Show all images for a specific restaurant
+python scripts/debug_quality_scores.py --place-id ChIJxxx
+
+# Show only failed images (to check if good ones are being rejected)
+python scripts/debug_quality_scores.py --place-id ChIJxxx --show-failed
+
+# Re-score a specific image manually
+python scripts/debug_quality_scores.py --rescore-image 123
+
+# Show images with low scores that are currently displayed
+python scripts/debug_quality_scores.py --low-score-displayed
+```
+
+### Quality Score Thresholds
+
+Images must pass these thresholds to be displayed (configured in `app/config/ai_versions.py`):
+
+| Metric | Threshold | Meaning |
+|--------|-----------|---------|
+| `people_confidence_score` | > 0.6 | Not people-focused |
+| `image_quality_score` | > 0.5 | Clear enough to display |
+
+See `QUALITY_SCORING.md` for full documentation on the quality scoring system.
+

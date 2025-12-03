@@ -181,6 +181,7 @@ Available components:
 - `tags` - AI-generated tags per image
 - `description` - AI-generated restaurant description
 - `embedding` - Vector embeddings for semantic search
+- `quality` - Image quality scoring (people detection, image clarity)
 - `all` - All of the above
 
 ## Rate Limiting
@@ -323,6 +324,7 @@ The system tracks which version of AI logic generated each piece of data:
 - `embedding_version` / `embedding_updated_at` on Restaurant  
 - `category_version` / `category_updated_at` on RestaurantImage
 - `tags_version` / `tags_updated_at` on RestaurantImage
+- `quality_version` / `quality_scored_at` on RestaurantImage
 
 Versions are defined in `app/config/ai_versions.py`:
 
@@ -331,9 +333,12 @@ CATEGORY_VERSION = "v1.0"
 TAGS_VERSION = "v1.0"
 DESCRIPTION_VERSION = "v1.0"
 EMBEDDING_VERSION = "v1.0"
+QUALITY_VERSION = "v1.1"  # Image quality scoring
 ```
 
 When you change a prompt, bump the corresponding version. The `refresh-stale` mode will then identify and update all data generated with the old version.
+
+See `QUALITY_SCORING.md` for detailed documentation on the quality scoring system.
 
 ## Troubleshooting
 

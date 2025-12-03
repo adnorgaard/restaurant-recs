@@ -199,6 +199,8 @@ restaurant-recs/
 ├── app/
 │   ├── main.py                    # FastAPI app, all endpoints
 │   ├── database.py                # Database connection
+│   ├── config/
+│   │   └── ai_versions.py         # AI prompt versions and quality thresholds
 │   ├── models/
 │   │   ├── database.py            # SQLAlchemy models
 │   │   └── schemas.py             # Pydantic request/response schemas
@@ -209,10 +211,13 @@ restaurant-recs/
 │       ├── database_service.py    # Database operations + caching
 │       ├── embedding_service.py   # Vector embeddings
 │       ├── recommendation_service.py  # Similarity algorithms
+│       ├── quality_service.py     # Image quality scoring (GPT-4 Vision)
 │       ├── auth_service.py        # JWT authentication
 │       └── debug_service.py       # Cache inspection tools
 ├── alembic/                       # Database migrations
 ├── scripts/                       # Setup and utility scripts
+├── templates/                     # HTML templates
+│   └── index.html                 # Web interface template
 ├── requirements.txt
 └── .env                           # Your environment variables
 ```
@@ -224,6 +229,9 @@ restaurant-recs/
 
 ### restaurant_images  
 - `id`, `restaurant_id`, `photo_name`, `gcs_url`, `gcs_bucket_path`, `category`, `ai_tags`, `created_at`, `updated_at`
+- Quality scores: `people_confidence_score`, `image_quality_score`, `quality_version`, `quality_scored_at`
+- Metadata tags: `time_of_day`, `indoor_outdoor`
+- Display flag: `is_displayed`
 
 ### users
 - `id`, `email`, `hashed_password`, `is_active`, `is_superuser`, `created_at`, `updated_at`
@@ -261,6 +269,8 @@ See `CACHING_ARCHITECTURE.md` for detailed documentation.
 - **GCS Setup**: `GCS_SETUP.md`
 - **Caching Details**: `CACHING_ARCHITECTURE.md`
 - **Debug Guide**: `DEBUG_GUIDE.md`
+- **Quality Scoring**: `QUALITY_SCORING.md`
+- **Bulk Processing**: `BULK_PROCESSING.md`
 
 ## License
 

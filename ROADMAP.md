@@ -16,10 +16,12 @@ _Highlight 3-5 items to focus on in the near term._
 
 _Move items here when done to track progress._
 
-- [x] Quality scoring for images
+- [x] Quality scoring v1.1 - Unified `image_quality_score` (replaced lighting+blur), added `time_of_day` and `indoor_outdoor` metadata tags
+- [x] Quality scoring for images (v1.0)
 - [x] SerpAPI integration for additional data
 - [x] Bulk processing system
 - [x] GCS image caching
+- [x] Extract HTML template to `templates/index.html`
 
 ---
 
@@ -141,9 +143,10 @@ _Move items here when done to track progress._
 
 - [ ] **Duplicate detection** — Identify and merge duplicate restaurant entries
 - [ ] **Stale data refresh** — Re-analyze restaurants periodically to catch updates
-- [ ] **Image quality filtering** — Automatically exclude blurry/dark/irrelevant images
+- [x] **Image quality filtering** — Automatically exclude blurry/dark/irrelevant images _(Implemented in quality_service.py with GPT-4 Vision scoring)_
 - [ ] **Tag normalization** — Consolidate similar tags (e.g., "cozy" and "intimate")
 - [ ] **Manual curation tools** — Admin interface to correct misclassified data
+- [ ] **Time-of-day filtering** — Filter images by day/night using `time_of_day` metadata
 
 ---
 
